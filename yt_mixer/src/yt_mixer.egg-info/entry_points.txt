@@ -1,0 +1,2 @@
+[console_scripts]
+yt-mixer = yt_mixer.cli:main

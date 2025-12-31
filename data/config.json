@@ -1,0 +1,13 @@
+{
+  "host": "0.0.0.0",
+  "port": 5003,
+  "max_keep_chunks": 3,
+  "prune_age_days": 7,
+  "target_chunk_duration": 3600,
+  "default_music_volume": 0.4,
+  "default_speech_volume": 1.0,
+  "default_playlists": {
+    "music": "",
+    "speech": ""
+  }
+}
