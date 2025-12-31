@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # yt-mixer
 YT Mixer - Server-side YouTube playlist mixer with real shuffle
 =======
@@ -38,4 +37,3 @@ yt-mixer service start
 2. **Properly shuffles** them using Fisher-Yates for true randomness
 3. Applies vocal EQ + per-track normalization
 4. Streams hour-long chunks with incremental quality upgrades (Immediate → Quick → Final)
->>>>>>> 6fe8266 (Update README.md)
