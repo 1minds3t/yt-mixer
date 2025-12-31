@@ -1,4 +1,3 @@
-=======
 # YT Mixer 🎵
 
 Server-side YouTube playlist mixer with **true shuffle** for more unpredictable playback order.
