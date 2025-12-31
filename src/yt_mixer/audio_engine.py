@@ -380,14 +380,8 @@ class AudioWorker:
         """Main loop: ensures chunks are ready"""
         while self.running:
             with self.lock:
-                # Promote preloaded chunk to current if needed
-                if not self.current_chunk_path and self.preloaded_chunks:
-                    chunk_info = self.preloaded_chunks.pop(0)
-                    self.current_chunk_path = chunk_info['path']
-                    self.current_chunk_quality = chunk_info.get('quality', 'none')
-                    log.info(f"[{self.session_id}] Promoted chunk: {self.current_chunk_path} ({self.current_chunk_quality})")
-                
-                # Keep 2 chunks ahead
+                # DON'T auto-promote! Only user actions (stream endpoint or next_chunk) should promote
+                # Just keep 2 chunks preloaded
                 should_prepare = len(self.preloaded_chunks) < 2
                 if should_prepare:
                     next_idx = self.chunk_index + len(self.preloaded_chunks) + 1
