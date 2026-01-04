@@ -146,7 +146,33 @@ def cmd_service(args):
     elif args.install:
         install_systemd_service()
     elif args.logs:
-        subprocess.run(["journalctl", "--user", "-u", service_name, "-f"])
+        # Get the actual log file path from config
+        from .session_manager import manager
+        log_file = manager.log_file
+        
+        if not log_file.exists():
+            print(f"Log file not found: {log_file}")
+            return 1
+        
+        print(f"Following logs from: {log_file}")
+        
+        try:
+            process = subprocess.Popen(
+                ['tail', '-f', '-n', '50', str(log_file)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            
+            for line in iter(process.stdout.readline, ''):
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                
+        except KeyboardInterrupt:
+            if 'process' in locals():
+                process.terminate()
+            print("\nStopped following logs.")
+            sys.exit(0)
 
 def install_systemd_service():
     """Install systemd user service"""
@@ -170,6 +196,8 @@ WorkingDirectory={pkg_path}
 ExecStart={python_path} -m yt_mixer.routes
 Restart=on-failure
 RestartSec=10
+StandardOutput=journal
+StandardError=journal
 Environment="YT_MIXER_HOST={config.get('host')}"
 Environment="YT_MIXER_PORT={config.get('port')}"
 Environment="YT_MIXER_DATA_DIR={DATA_DIR}"
@@ -324,43 +352,32 @@ def cmd_logs(args):
         return 1
     
     if args.follow:
-        # Follow logs in real-time
-        import time
-        with open(log_file, 'r') as f:
-            # Jump to end
-            f.seek(0, 2)
-            print("=== Following logs (Ctrl+C to stop) ===")
-            try:
-                while True:
-                    line = f.readline()
-                    if line:
-                        print(line, end='')
-                    else:
-                        time.sleep(0.1)
-            except KeyboardInterrupt:
-                print("\nStopped following logs")
+        # Robustly follow logs using tail -f subprocess
+        print(f"=== Following logs from {log_file} (Ctrl+C to stop) ===")
+        try:
+            # Popen allows us to read the output line by line
+            process = subprocess.Popen(
+                ['tail', '-f', '-n', '50', str(log_file)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            # Read from stdout in a blocking manner, which is what we want
+            for line in iter(process.stdout.readline, ''):
+                sys.stdout.write(line)
+                sys.stdout.flush()
+
+        except KeyboardInterrupt:
+            print("\nStopped following logs.")
+        except Exception as e:
+            print(f"\nError following logs: {e}")
+        finally:
+            if 'process' in locals() and process.poll() is None:
+                process.terminate() # Ensure tail process is killed
     else:
-        # Show last N lines
+        # Show last N lines (this part was fine)
         lines = args.lines or 50
-        result = subprocess.run(
-            ['tail', f'-n{lines}', str(log_file)],
-            capture_output=True,
-            text=True
-        )
-        print(result.stdout)
-    """Update yt-dlp"""
-    print("Updating yt-dlp...")
-    result = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--no-cache-dir", "--upgrade", "yt-dlp"],
-        capture_output=True,
-        text=True
-    )
-    
-    if result.returncode == 0:
-        print("✓ yt-dlp updated successfully")
-    else:
-        print(f"✗ Update failed: {result.stderr}")
-        return 1
+        subprocess.run(['tail', f'-n{lines}', str(log_file)])
 
 def cmd_serve(args):
     """Start the web server directly"""

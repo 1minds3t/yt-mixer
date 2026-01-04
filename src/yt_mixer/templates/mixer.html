@@ -163,6 +163,30 @@
         
         .error { color: #ff6b6b; }
         .success { color: #51cf66; }
+        .warning { color: #ffa500; }
+
+        .error-log {
+            background: #1a1a1a;
+            padding: 20px;
+            border-radius: 8px;
+            margin-top: 20px;
+            border-left: 3px solid #ff6b6b;
+            font-family: monospace;
+            font-size: 12px;
+            line-height: 1.6;
+            display: none;
+        }
+
+        .error-log.has-errors {
+            display: block;
+        }
+
+        .error-entry {
+            padding: 8px;
+            margin: 5px 0;
+            background: rgba(255, 107, 107, 0.1);
+            border-radius: 4px;
+        }
 
         /* Animations for Notifications */
         @keyframes slideIn {
@@ -212,14 +236,30 @@
             <button onclick="loadChunk()">🔄 Load Chunk</button>
             <button onclick="nextChunk()">⏭️ Next Chunk</button>
             <button onclick="updateStatus()">📊 Refresh Status</button>
+            <button onclick="showLogs()">📋 View Logs</button>
         </div>
         
         <div class="status">
             <h3>Status</h3>
             <div id="status-content">Initializing...</div>
         </div>
+
+        <div id="error-log" class="error-log">
+            <h3>⚠️ Recent Errors</h3>
+            <div id="error-content"></div>
+        </div>
     </div>
-    
+        <div id="logModal" style="display:none; position:fixed; z-index:1000; left:0; top:0; width:100%; height:100%; overflow:auto; background-color:rgba(0,0,0,0.7);">
+    <div style="background-color:#1e1e1e; color:#d4d4d4; margin:5% auto; padding:20px; border:1px solid #888; width:80%; height:80%; display:flex; flex-direction:column;">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+        <h2 style="margin:0;">🔴 Live Logs</h2>
+        <button onclick="closeLogView()" style="font-size:24px; background:none; border:none; color:white; cursor:pointer;">&times;</button>
+        </div>
+        <pre id="logContent" style="flex-grow:1; overflow-y:scroll; background-color:#111; padding:10px; border-radius:5px; margin-top:10px; font-family:monospace; white-space:pre-wrap;"></pre>
+    </div>
+    </div>
+
+
     <script>
         // =========================================================
         // REAL-TIME MIXING MONITOR
@@ -233,21 +273,16 @@
             }
 
             init() {
-                // Create progress UI container
                 this.createProgressUI();
-                
-                // Start polling for progress
                 this.startPolling();
             }
 
             createProgressUI() {
-                // Check if container already exists
                 if (document.getElementById('mixing-progress')) {
                     this.progressContainer = document.getElementById('mixing-progress');
                     return;
                 }
 
-                // Create progress container
                 const container = document.createElement('div');
                 container.id = 'mixing-progress';
                 container.style.cssText = `
@@ -271,12 +306,9 @@
             }
 
             startPolling() {
-                // Poll every 2 seconds
                 this.pollInterval = setInterval(() => {
                     this.fetchProgress();
                 }, 2000);
-                
-                // Initial fetch
                 this.fetchProgress();
             }
 
@@ -293,34 +325,38 @@
                     if (!response.ok) return;
                     
                     const status = await response.json();
-                    
-                    // COMPATIBILITY LAYER:
-                    // Ensure current_chunk_quality exists for the UI logic below
-                    if (status.current_chunk_quality === undefined && status.current_chunk_is_final !== undefined) {
-                        status.current_chunk_quality = status.current_chunk_is_final ? 'final' : 'quick';
-                    }
-                    
                     this.updateUI(status);
+                    this.updateErrors(status);
                 } catch (error) {
                     console.error('Progress fetch error:', error);
                 }
             }
 
+            updateErrors(status) {
+                const errorLog = document.getElementById('error-log');
+                const errorContent = document.getElementById('error-content');
+                
+                if (status.errors && status.errors.length > 0) {
+                    errorLog.classList.add('has-errors');
+                    errorContent.innerHTML = status.errors.map(err => 
+                        `<div class="error-entry"><span style="opacity:0.6">[${err.time}]</span> ${err.message}</div>`
+                    ).join('');
+                } else {
+                    errorLog.classList.remove('has-errors');
+                }
+            }
+
             updateUI(status) {
                 if (!status.mix_progress || Object.keys(status.mix_progress).length === 0) {
-                    // No active mixing, hide UI
                     this.progressContainer.style.display = 'none';
                     return;
                 }
 
-                // Show UI
                 this.progressContainer.style.display = 'block';
 
-                // Build progress HTML
                 let html = '<div style="margin-bottom: 10px; font-weight: 600; font-size: 14px;">';
                 html += '🎵 Mixing Progress</div>';
 
-                // Show current chunk quality
                 const qualityBadges = {
                     'immediate': '<span style="background:#f59e0b;padding:2px 6px;border-radius:3px;font-size:11px;">⚡ IMMEDIATE</span>',
                     'quick': '<span style="background:#3b82f6;padding:2px 6px;border-radius:3px;font-size:11px;">📊 QUICK</span>',
@@ -333,8 +369,14 @@
                 html += `<div style="margin-bottom: 12px; opacity: 0.8;">
                     Playing: Chunk ${status.chunk_index} ${qualityBadge}
                 </div>`;
+                
+                // Show LUFS queue status
+                if (status.lufs_in_progress && status.lufs_in_progress > 0) {
+                    html += `<div style="margin-bottom: 12px; padding: 8px; background: rgba(255,165,0,0.2); border-radius: 4px; font-size: 11px;">
+                        🔥 LUFS Processing: ${status.lufs_in_progress} chunk(s) - Chunks: ${(status.lufs_chunks || []).join(', ')}
+                    </div>`;
+                }
 
-                // Show progress for each chunk
                 const chunks = Object.entries(status.mix_progress).sort((a, b) => b[0] - a[0]);
                 
                 for (const [chunkIdx, progress] of chunks) {
@@ -342,12 +384,17 @@
                     const percent = progress.percent || 0;
                     const isActive = progress.stage && progress.stage !== 'complete';
                     
-                    if (!isActive) continue; // Skip completed chunks
+                    if (!isActive) continue;
+                    
+                    // Highlight if this chunk is doing LUFS
+                    const isLufs = progress.stage === 'final_mix';
+                    const bgColor = isLufs ? 'rgba(255,165,0,0.15)' : 'rgba(255,255,255,0.05)';
+                    const chunkLabel = isLufs ? `Chunk ${chunkIdx} 🔥` : `Chunk ${chunkIdx}`;
 
                     html += `
-                        <div style="margin-bottom: 8px; padding: 8px; background: rgba(255,255,255,0.05); border-radius: 4px;">
+                        <div style="margin-bottom: 8px; padding: 8px; background: ${bgColor}; border-radius: 4px;">
                             <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
-                                <span>Chunk ${chunkIdx}</span>
+                                <span style="font-weight: ${isLufs ? 'bold' : 'normal'};">${chunkLabel}</span>
                                 <span style="opacity: 0.7;">${percent}%</span>
                             </div>
                             <div style="font-size: 11px; opacity: 0.8; margin-bottom: 4px;">${stageName}</div>
@@ -358,7 +405,6 @@
                     `;
                 }
 
-                // Show queue status
                 html += `
                     <div style="margin-top: 12px; padding-top: 12px; border-top: 1px solid rgba(255,255,255,0.1); font-size: 11px; opacity: 0.6;">
                         Preloaded: ${status.preloaded_count} chunks | 
@@ -383,11 +429,11 @@
 
             getStageColor(stage) {
                 const colors = {
-                    'collecting': '#3b82f6',      // blue
-                    'concatenating': '#8b5cf6',   // purple
-                    'immediate_mix': '#f59e0b',   // orange (instant)
-                    'quick_mix': '#3b82f6',       // blue (normalized)
-                    'final_mix': '#10b981'        // green (mastered)
+                    'collecting': '#3b82f6',
+                    'concatenating': '#8b5cf6',
+                    'immediate_mix': '#f59e0b',
+                    'quick_mix': '#3b82f6',
+                    'final_mix': '#10b981'
                 };
                 return colors[stage] || '#6b7280';
             }
@@ -404,7 +450,6 @@
         // MAIN APPLICATION LOGIC
         // =========================================================
         
-        // Get session ID from URL
         const urlParams = new URLSearchParams(window.location.search);
         const sessionID = urlParams.get('sid');
         
@@ -414,34 +459,28 @@
         
         let isPlaying = false;
         
-        // Initialize mixing monitor and player
         document.addEventListener('DOMContentLoaded', () => {
             if (sessionID) {
-                // Initialize the monitor
                 window.mixingMonitor = new MixingProgressMonitor();
             }
         });
 
-        // Cleanup on page unload
         window.addEventListener('beforeunload', () => {
             if (window.mixingMonitor) {
                 window.mixingMonitor.destroy();
             }
         });
         
-        // Show appropriate UI based on session
         if (sessionID) {
             document.getElementById('setup-form').style.display = 'none';
             document.getElementById('player-section').classList.add('active');
             
-            // Show bookmark info
             const bookmarkDiv = document.getElementById('bookmark-info');
             bookmarkDiv.innerHTML = `
                 <strong>🔗 Bookmark this URL to return to your mix:</strong><br>
                 <a href="/?sid=${sessionID}">${window.location.origin}/?sid=${sessionID}</a>
             `;
             
-            // Initialize player
             initializePlayer();
         } else {
             document.getElementById('setup-form').style.display = 'block';
@@ -457,15 +496,11 @@
                 return;
             }
             
-            // Redirect to create session
             window.location.href = `/?m=${encodeURIComponent(musicId)}&s=${encodeURIComponent(speechId)}`;
         }
         
         function initializePlayer() {
-            // Load initial chunk
             updateStatus();
-            
-            // Auto-update status every 10 seconds (for the main text status)
             setInterval(updateStatus, 10000);
         }
         
@@ -490,7 +525,6 @@
             }
         }
         
-        // Sync button with audio element
         audio.onplay = () => {
             bigPlayBtn.textContent = '⏸';
             isPlaying = true;
@@ -504,7 +538,6 @@
         function loadChunk() {
             statusContent.innerHTML = '<span class="success">Loading audio...</span>';
             
-            // Add timestamp to prevent caching
             audio.src = `/stream?t=${Date.now()}`;
             audio.load();
             
@@ -520,7 +553,7 @@
             };
             
             audio.onerror = () => {
-                statusContent.innerHTML = '<span class="error">Waiting for audio (First mix takes ~10s)...</span>';
+                statusContent.innerHTML = '<span class="warning">Waiting for audio (First mix takes 10-30s)...</span>';
             };
         }
         
@@ -556,17 +589,26 @@
                     const chunkName = data.current_chunk ? 
                         data.current_chunk.split('/').pop() : 'None (preparing...)';
 
-                    // Simplified text status for the main box (Detailed status is in the Monitor)
-                    let qualityText = '';
-                    if (data.current_chunk) {
-                        qualityText = data.current_chunk_is_final ? '(FINAL Mix)' : '(QUICK Mix)';
+                    const qualityMap = {
+                        'immediate': '⚡ IMMEDIATE (Raw mix - upgrading...)',
+                        'quick': '📊 QUICK (Normalized)',
+                        'final': '✨ FINAL (LUFS mastered)',
+                        'none': '⏳ Preparing...'
+                    };
+                    const qualityText = qualityMap[data.current_chunk_quality] || '';
+                    
+                    let lufsInfo = '';
+                    if (data.lufs_in_progress && data.lufs_in_progress > 0) {
+                        lufsInfo = `<br><strong style="color:#ffa500;">🔥 LUFS Active:</strong> ${data.lufs_in_progress} chunk(s) - ${(data.lufs_chunks || []).join(', ')}`;
                     }
                     
                     statusContent.innerHTML = `
                         <strong>Session:</strong> ${data.session_id || sessionID}<br>
-                        <strong>Current Chunk:</strong> ${chunkName} ${qualityText}<br>
+                        <strong>Current Chunk:</strong> ${chunkName}<br>
+                        <strong>Quality:</strong> ${qualityText}<br>
                         <strong>Chunk Index:</strong> ${data.chunk_index || 0}<br>
                         <strong>Ready Chunks:</strong> ${data.preloaded_count || 0}<br>
+                        <strong>Queue Status:</strong> Music: ${data.music_queue_size || 0}, Speech: ${data.speech_queue_size || 0}${lufsInfo}
                     `;
                 })
                 .catch(err => {
@@ -574,14 +616,81 @@
                     statusContent.innerHTML = `<span class="error">Status unavailable</span>`;
                 });
         }
+
+        function showLogs() {
+            fetch('/api/logs')
+                .then(r => r.json())
+                .then(data => {
+                    if (data.logs && data.logs.length > 0) {
+                        const logWindow = window.open('', 'Log Viewer', 'width=800,height=600');
+                        logWindow.document.write('<html><head><title>YT-Mixer Logs</title>');
+                        logWindow.document.write('<style>body{background:#1a1a1a;color:#eee;font-family:monospace;padding:20px;font-size:12px;line-height:1.6;}</style>');
+                        logWindow.document.write('</head><body><pre>');
+                        logWindow.document.write(data.logs.join(''));
+                        logWindow.document.write('</pre></body></html>');
+                    } else {
+                        alert('No logs available');
+                    }
+                })
+                .catch(err => {
+                    alert('Error loading logs: ' + err.message);
+                });
+        }
+        let logEventSource = null;
+
+        function viewLogs() {
+            const modal = document.getElementById('logModal');
+            const content = document.getElementById('logContent');
+            
+            modal.style.display = 'block';
+            content.innerHTML = 'Connecting to log stream...\n';
+
+            // Disconnect any previous stream
+            if (logEventSource) {
+                logEventSource.close();
+            }
+
+            // Connect to our new SSE endpoint
+            logEventSource = new EventSource('/api/logs/stream');
+
+            logEventSource.onopen = function(event) {
+                content.innerHTML += 'Connection established.\n\n';
+            };
+
+            logEventSource.onmessage = function(event) {
+                // Parse the JSON data from the server
+                const logData = JSON.parse(event.data);
+                const logLine = logData.line;
+                
+                // Append and scroll down
+                content.innerHTML += logLine + '\n';
+                content.scrollTop = content.scrollHeight;
+            };
+
+            logEventSource.onerror = function(event) {
+                content.innerHTML += '\n--- CONNECTION ERROR ---\nStream disconnected. Will attempt to reconnect.\n';
+                console.error("EventSource failed:", event);
+                // The browser will automatically try to reconnect
+            };
+        }
+
+        function closeLogView() {
+            const modal = document.getElementById('logModal');
+            modal.style.display = 'none';
+
+            // IMPORTANT: Close the connection to save server resources
+            if (logEventSource) {
+                logEventSource.close();
+                logEventSource = null;
+                console.log("Log stream closed.");
+            }
+        }
         
-        // Auto-advance to next chunk when current ends
         audio.onended = () => {
             console.log("Audio ended, advancing to next chunk");
             nextChunk();
         };
 
-        // Listen for custom quality upgrade events
         window.addEventListener('chunk-upgraded', (event) => {
             const notification = document.createElement('div');
             notification.style.cssText = `

@@ -1,3 +1,5 @@
+LICENSE
+README.md
 pyproject.toml
 src/yt_mixer/__init__.py
 src/yt_mixer/audio_engine.py
