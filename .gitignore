@@ -48,3 +48,5 @@ htmlcov/
 *.egg-info/
 src/yt_mixer.egg-info/
 *.egg-info/
+__pycache__/
+*.pyc
