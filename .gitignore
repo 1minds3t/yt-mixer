@@ -47,3 +47,4 @@ htmlcov/
 .cache/
 *.egg-info/
 src/yt_mixer.egg-info/
+*.egg-info/
