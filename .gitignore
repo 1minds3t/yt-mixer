@@ -4,25 +4,46 @@ __pycache__/
 *$py.class
 *.so
 .Python
-build/
-dist/
+*.egg
 *.egg-info/
-.eggs/
+dist/
+build/
+*.whl
+pip-log.txt
+pip-delete-this-directory.txt
 
-# Data/Cache
-data/
-*.log
-*.pid
+# Virtual Environments
+venv/
+env/
+ENV/
+.venv
 
-# IDE
+# IDEs
 .vscode/
 .idea/
 *.swp
 *.swo
+*~
 
 # OS
 .DS_Store
 Thumbs.db
-build/
-build/
-build/
+
+# Logs
+*.log
+logs/
+
+# Backups
+*.bak
+*.backup
+*.old
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Project specific
+.cache/
+*.egg-info/
+src/yt_mixer.egg-info/

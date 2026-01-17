@@ -231,7 +231,8 @@ class SessionManager:
         """
         sessions = []
         
-        for session_dir in CHUNK_DIR.glob('*'):
+        session_dirs = list(CHUNK_DIR.glob('*'))
+        for session_dir in session_dirs:
             if session_dir.is_dir():
                 chunks = list(session_dir.glob('*.mp3'))
                 size_mb = sum(f.stat().st_size for f in chunks) / (1024 * 1024)
@@ -275,7 +276,8 @@ class SessionManager:
         
         log.info("Running session cleanup...")
         
-        for session_dir in CHUNK_DIR.glob('*'):
+        session_dirs = list(CHUNK_DIR.glob('*'))
+        for session_dir in session_dirs:
             if not session_dir.is_dir():
                 continue
             

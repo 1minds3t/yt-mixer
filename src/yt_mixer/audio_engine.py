@@ -70,7 +70,7 @@ class AudioWorker:
             })
             self.error_log = self.error_log[-10:]
 
-    def get_video_ids(self, playlist_url, max_fetch=50):
+    def get_video_ids(self, playlist_url, max_fetch=None):
         """Extract video IDs"""
         if "&si=" in playlist_url:
             playlist_url = playlist_url.split("&si=")[0]
@@ -81,7 +81,7 @@ class AudioWorker:
         ydl_opts = {
             'quiet': True,
             'extract_flat': True,
-            'playlistend': max_fetch,
+            # 'playlistend': max_fetch,
             'no_warnings': True
         }
         try:
@@ -138,7 +138,7 @@ class AudioWorker:
         
         if len(queue) < 10:
             playlist_url = self.music_pid if queue_type == 'music' else self.speech_pid
-            new_ids = self.get_video_ids(playlist_url, max_fetch=50)
+            new_ids = self.get_video_ids(playlist_url)
             if new_ids:
                 queue.extend(new_ids)
                 log.info(f"[{self.session_id}] Refilled {queue_type} queue: {len(new_ids)}")

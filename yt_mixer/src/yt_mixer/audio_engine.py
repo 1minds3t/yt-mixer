@@ -43,8 +43,8 @@ class AudioWorker:
         self.thread = threading.Thread(target=self._background_loop, daemon=True)
         self.thread.start()
 
-    def get_video_ids(self, playlist_url, max_fetch=50):
-        """Extract video IDs - ONLY FETCH WHAT WE NEED"""
+    def get_video_ids(self, playlist_url, max_fetch=None):
+        """Extract video IDs from entire playlist"""
         if "&si=" in playlist_url:
             playlist_url = playlist_url.split("&si=")[0]
         if "youtube.com" not in playlist_url:
@@ -54,7 +54,6 @@ class AudioWorker:
         ydl_opts = {
             'quiet': True,
             'extract_flat': True,
-            'playlistend': max_fetch,
             'no_warnings': True
         }
         try:
@@ -111,7 +110,7 @@ class AudioWorker:
         
         if len(queue) < 10:
             playlist_url = self.music_pid if queue_type == 'music' else self.speech_pid
-            new_ids = self.get_video_ids(playlist_url, max_fetch=50)
+            new_ids = self.get_video_ids(playlist_url)
             if new_ids:
                 queue.extend(new_ids)
                 log.info(f"[{self.session_id}] Refilled {queue_type} queue: {len(new_ids)} new videos")
