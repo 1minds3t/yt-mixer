@@ -458,13 +458,51 @@
         const statusContent = document.getElementById('status-content');
         
         let isPlaying = false;
-        
+        let currentChunkIndex = 0;
+        let savedPosition = 0;
+        let positionSaveInterval = null;
+        let isInitialLoad = true;
         document.addEventListener('DOMContentLoaded', () => {
             if (sessionID) {
                 window.mixingMonitor = new MixingProgressMonitor();
             }
         });
+        // Save playback position every 5 seconds
+        function startPositionSaving() {
+            if (positionSaveInterval) clearInterval(positionSaveInterval);
+            
+            positionSaveInterval = setInterval(() => {
+                if (!audio.paused && !audio.ended && sessionID) {
+                    fetch('/api/playback/position', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            session_id: sessionID,
+                            chunk_index: currentChunkIndex,
+                            position: audio.currentTime
+                        })
+                    }).catch(e => console.error('Position save failed:', e));
+                }
+            }, 5000);
+        }
 
+        // Load saved position from server
+        async function loadSavedPosition() {
+            if (!sessionID) return;
+            
+            try {
+                const resp = await fetch(`/api/playback/position/${sessionID}`);
+                const data = await resp.json();
+                
+                if (data.chunk_index !== undefined) {
+                    currentChunkIndex = data.chunk_index;
+                    savedPosition = data.position_seconds || 0;
+                    console.log(`Restored position: chunk ${currentChunkIndex}, time ${savedPosition}s`);
+                }
+            } catch (e) {
+                console.error('Failed to load saved position:', e);
+            }
+        }
         window.addEventListener('beforeunload', () => {
             if (window.mixingMonitor) {
                 window.mixingMonitor.destroy();
@@ -499,7 +537,9 @@
             window.location.href = `/?m=${encodeURIComponent(musicId)}&s=${encodeURIComponent(speechId)}`;
         }
         
-        function initializePlayer() {
+        async function initializePlayer() {
+            await loadSavedPosition();
+            startPositionSaving();
             updateStatus();
             setInterval(updateStatus, 10000);
         }
@@ -539,6 +579,16 @@
             statusContent.innerHTML = '<span class="success">Loading audio...</span>';
             
             audio.src = `/stream?t=${Date.now()}`;
+
+            // Restore saved position on first load
+            if (isInitialLoad && savedPosition > 0) {
+                audio.addEventListener('loadedmetadata', function restorePos() {
+                    audio.currentTime = savedPosition;
+                    audio.removeEventListener('loadedmetadata', restorePos);
+                    isInitialLoad = false;
+                });
+            }
+
             audio.load();
             
             audio.oncanplaythrough = () => {
@@ -564,9 +614,11 @@
                 .then(r => r.json())
                 .then(data => {
                     if (data.success) {
-                        setTimeout(() => {
-                            loadChunk();
-                        }, 500);
+                    currentChunkIndex = data.chunk_index;
+                    savedPosition = 0; // Reset for new chunk
+                    setTimeout(() => {
+                        loadChunk();
+                    }, 500);
                     } else {
                         statusContent.innerHTML = `<span class="error">No next chunk available: ${data.error || 'Still preparing'}</span>`;
                     }
@@ -588,7 +640,7 @@
                     
                     const chunkName = data.current_chunk ? 
                         data.current_chunk.split('/').pop() : 'None (preparing...)';
-
+                    currentChunkIndex = data.chunk_index || 0;
                     const qualityMap = {
                         'immediate': '⚡ IMMEDIATE (Raw mix - upgrading...)',
                         'quick': '📊 QUICK (Normalized)',
@@ -618,72 +670,37 @@
         }
 
         function showLogs() {
-            fetch('/api/logs')
-                .then(r => r.json())
-                .then(data => {
-                    if (data.logs && data.logs.length > 0) {
-                        const logWindow = window.open('', 'Log Viewer', 'width=800,height=600');
-                        logWindow.document.write('<html><head><title>YT-Mixer Logs</title>');
-                        logWindow.document.write('<style>body{background:#1a1a1a;color:#eee;font-family:monospace;padding:20px;font-size:12px;line-height:1.6;}</style>');
-                        logWindow.document.write('</head><body><pre>');
-                        logWindow.document.write(data.logs.join(''));
-                        logWindow.document.write('</pre></body></html>');
-                    } else {
-                        alert('No logs available');
-                    }
-                })
-                .catch(err => {
-                    alert('Error loading logs: ' + err.message);
-                });
+            // Use the existing viewLogs() function which shows modal
+            viewLogs();
         }
-        let logEventSource = null;
 
         function viewLogs() {
             const modal = document.getElementById('logModal');
             const content = document.getElementById('logContent');
             
             modal.style.display = 'block';
-            content.innerHTML = 'Connecting to log stream...\n';
+            content.innerHTML = 'Loading logs...\n';
 
-            // Disconnect any previous stream
-            if (logEventSource) {
-                logEventSource.close();
-            }
-
-            // Connect to our new SSE endpoint
-            logEventSource = new EventSource('/api/logs/stream');
-
-            logEventSource.onopen = function(event) {
-                content.innerHTML += 'Connection established.\n\n';
-            };
-
-            logEventSource.onmessage = function(event) {
-                // Parse the JSON data from the server
-                const logData = JSON.parse(event.data);
-                const logLine = logData.line;
-                
-                // Append and scroll down
-                content.innerHTML += logLine + '\n';
-                content.scrollTop = content.scrollHeight;
-            };
-
-            logEventSource.onerror = function(event) {
-                content.innerHTML += '\n--- CONNECTION ERROR ---\nStream disconnected. Will attempt to reconnect.\n';
-                console.error("EventSource failed:", event);
-                // The browser will automatically try to reconnect
-            };
+            // Simple fetch, no SSE
+            fetch('/api/logs')
+                .then(r => r.json())
+                .then(data => {
+                    if (data.logs && data.logs.length > 0) {
+                        content.innerHTML = data.logs.join('');
+                        // Auto-scroll to bottom
+                        content.scrollTop = content.scrollHeight;
+                    } else {
+                        content.innerHTML = 'No logs available\n';
+                    }
+                })
+                .catch(err => {
+                    content.innerHTML = 'Error loading logs: ' + err.message + '\n';
+                });
         }
 
         function closeLogView() {
             const modal = document.getElementById('logModal');
             modal.style.display = 'none';
-
-            // IMPORTANT: Close the connection to save server resources
-            if (logEventSource) {
-                logEventSource.close();
-                logEventSource = null;
-                console.log("Log stream closed.");
-            }
         }
         
         audio.onended = () => {

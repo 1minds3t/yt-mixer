@@ -1,52 +1,14 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-*.egg
-*.egg-info/
-dist/
-build/
-*.whl
-pip-log.txt
-pip-delete-this-directory.txt
-
-# Virtual Environments
-venv/
-env/
-ENV/
-.venv
-
-# IDEs
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Logs
-*.log
-logs/
-
-# Backups
-*.bak
-*.backup
-*.old
-
-# Testing
-.pytest_cache/
-.coverage
-htmlcov/
-
-# Project specific
-.cache/
-*.egg-info/
-src/yt_mixer.egg-info/
-*.egg-info/
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+.eggs/
+dist/
+build/
+*.log
+.DS_Store

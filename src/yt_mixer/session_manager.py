@@ -61,10 +61,16 @@ class SessionManager:
         self.config_file = DATA_DIR / "sessions.json"
         self.session_metadata = {}  # {sid: {music_pid, speech_pid}}
         self._load_session_metadata()
+    
+        # NEW: Playback state tracking
+        self.playback_state_file = DATA_DIR / "playback_state.json"
+        self.playback_state = {}  # {sid: {chunk_index, position_seconds, last_updated}}
+        self._load_playback_state()
         
         # Background maintenance thread (started on demand)
         self.running = False
         self.cleaner_thread = None
+        self._thread_started = False  # Track if thread has been started
         
         log.info("SessionManager initialized")
     
@@ -86,13 +92,58 @@ class SessionManager:
                 json.dump(self.session_metadata, f, indent=2)
         except Exception as e:
             log.error(f"Error saving session metadata: {e}")
+
+    def _load_playback_state(self):
+        """Load playback positions from disk"""
+        if self.playback_state_file.exists():
+            try:
+                with open(self.playback_state_file, 'r') as f:
+                    self.playback_state = json.load(f)
+                log.info(f"Loaded playback state for {len(self.playback_state)} sessions")
+            except Exception as e:
+                log.error(f"Error loading playback state: {e}")
+                self.playback_state = {}
+
+    def _save_playback_state(self):
+        """Save playback positions to disk"""
+        try:
+            with open(self.playback_state_file, 'w') as f:
+                json.dump(self.playback_state, f, indent=2)
+        except Exception as e:
+            log.error(f"Error saving playback state: {e}")
+
+    def update_playback_position(self, session_id, chunk_index, position_seconds):
+        """Update and persist playback position - called every 5s from client"""
+        with self.lock:
+            self.playback_state[session_id] = {
+                'chunk_index': chunk_index,
+                'position_seconds': position_seconds,
+                'last_updated': time.time()
+            }
+            self._save_playback_state()
+            log.debug(f"[{session_id}] Saved position: chunk {chunk_index}, {position_seconds:.1f}s")
+
+    def get_playback_position(self, session_id):
+        """Get saved playback position for session - used for resume after crash"""
+        with self.lock:
+            return self.playback_state.get(session_id, {
+                'chunk_index': 0,
+                'position_seconds': 0
+            })
     
     def start_maintenance(self):
-        """Start the background maintenance thread"""
-        if self.cleaner_thread is None or not self.cleaner_thread.is_alive():
+        """Start the background maintenance thread - IDEMPOTENT (safe to call multiple times)"""
+        with self.lock:
+            # Check if thread is already running
+            if self._thread_started and self.cleaner_thread and self.cleaner_thread.is_alive():
+                log.debug("Maintenance thread already running, skipping start")
+                return
+            
+            # Start new thread
             self.running = True
             self.cleaner_thread = threading.Thread(target=self._cleanup_loop, daemon=True)
             self.cleaner_thread.start()
+            self._thread_started = True
             log.info("Started maintenance thread")
     
     def get_session_id(self, music_id, speech_id):
@@ -263,7 +314,8 @@ class SessionManager:
         while self.running:
             try:
                 time.sleep(3600)  # 1 hour
-                self._prune_old_sessions()
+                if self.running:  # Check again after sleep
+                    self._prune_old_sessions()
             except Exception as e:
                 log.error(f"Error in cleanup loop: {e}")
     

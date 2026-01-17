@@ -5,7 +5,7 @@ from .session_manager import manager
 from .config import config
 import time
 from flask import Response
-
+import json
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
@@ -127,34 +127,6 @@ def get_recent_logs():
         return jsonify(logs=recent)
     except Exception as e:
         return jsonify(error=str(e)), 500
-
-@app.route('/api/logs/stream')
-def stream_logs():
-    """Stream log file using Server-Sent Events (SSE)."""
-    def generate_log_stream():
-        log_file = manager.log_file
-        if not log_file.exists():
-            yield f"data: LOG FILE NOT FOUND: {log_file}\n\n"
-            return
-
-        with open(log_file, 'r') as f:
-            # Go to the end of the file
-            f.seek(0, 2)
-            
-            while True:
-                line = f.readline()
-                if line:
-                    # SSE format: data: {message}\n\n
-                    # We'll send JSON so the frontend can easily parse it
-                    data = {"line": line.strip()}
-                    yield f"data: {json.dumps(data)}\n\n"
-                else:
-                    # Send a ping every 10 seconds to keep connection alive
-                    yield ": ping\n\n"
-                    time.sleep(1) # Sleep when no new lines
-                    
-    # The mimetype for SSE is 'text/event-stream'
-    return Response(generate_log_stream(), mimetype='text/event-stream')
 
 # ============================================================================
 # AUDIO STREAMING ROUTES
@@ -293,6 +265,40 @@ def delete_session(sid):
     except Exception as e:
         log.error(f"Error deleting session {sid}: {e}")
         return jsonify(success=False, error=str(e)), 500
+
+# Add these new routes to routes.py (around line 150, before the session management section)
+
+# ============================================================================
+# PLAYBACK STATE PERSISTENCE ROUTES
+# ============================================================================
+
+@app.route('/api/playback/position', methods=['POST'])
+def update_position():
+    """Update playback position (called periodically from client every 5s)"""
+    data = request.get_json()
+    sid = data.get('session_id')
+    chunk_idx = data.get('chunk_index', 0)
+    position = data.get('position', 0)
+    
+    if not sid:
+        return jsonify(error="Missing session_id"), 400
+    
+    try:
+        manager.update_playback_position(sid, chunk_idx, position)
+        return jsonify(success=True)
+    except Exception as e:
+        log.error(f"Error updating playback position: {e}")
+        return jsonify(error=str(e)), 500
+
+@app.route('/api/playback/position/<sid>')
+def get_position(sid):
+    """Get saved playback position for resuming after browser crash/close"""
+    try:
+        position = manager.get_playback_position(sid)
+        return jsonify(position)
+    except Exception as e:
+        log.error(f"Error getting playback position: {e}")
+        return jsonify(error=str(e)), 500
 
 @app.route('/api/session/active')
 def get_active_session():
