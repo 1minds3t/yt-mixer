@@ -12,3 +12,11 @@ dist/
 build/
 *.log
 .DS_Store
+
+# Runtime data
+data/mixed_chunks/
+data/raw_audio/
+data/sessions.json
+data/playback_state.json
+data/yt-mixer.pid
+data/yt-mixer.log
