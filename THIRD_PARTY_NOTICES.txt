@@ -1,0 +1,15 @@
+yt_mixer includes the following third-party software:
+================================================================================
+
+Flask (v3.1.2)
+License: BSD-3-Clause
+See licenses/Flask.txt for full license text
+
+eventlet (v0.40.4)
+License: MIT
+See licenses/eventlet.txt for full license text
+
+yt-dlp (v2026.2.4)
+License: Unlicense
+See licenses/yt-dlp.txt for full license text
+

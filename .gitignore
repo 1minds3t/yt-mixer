@@ -20,3 +20,63 @@ data/sessions.json
 data/playback_state.json
 data/yt-mixer.pid
 data/yt-mixer.log
+
+# Python compiled
+*.py[cod]
+
+# Python compiled
+*$py.class
+
+# C extensions
+*.so
+
+# Build artifacts
+develop-eggs/
+
+# Build artifacts
+downloads/
+
+# Build artifacts
+eggs/
+
+# Build artifacts
+lib/
+
+# Build artifacts
+lib64/
+
+# Build artifacts
+parts/
+
+# Build artifacts
+sdist/
+
+# Build artifacts
+var/
+
+# Build artifacts
+wheels/
+
+# Build artifacts
+.installed.cfg
+
+# Python package
+*.egg
+
+# Testing
+.pytest_cache/
+
+# Testing
+.coverage
+
+# Testing
+htmlcov/
+
+# Environment
+.env
+
+# Virtual environment
+.venv
+
+# Backup files
+*.bak

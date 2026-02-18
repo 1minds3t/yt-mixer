@@ -38,6 +38,9 @@ yt-mixer = "yt_mixer.cli:main"
 Homepage = "https://github.com/1minds3t/yt_mixer"
 Issues = "https://github.com/1minds3t/yt_mixer/issues"
 
+[tool.setuptools]
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.txt"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
