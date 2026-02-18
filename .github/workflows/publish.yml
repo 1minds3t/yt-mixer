@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write  # IMPORTANT: Required for OIDC
 
 jobs:
   pypi-publish:
@@ -14,8 +15,6 @@ jobs:
     environment:
       name: pypi
       url: https://pypi.org/p/yt_mixer
-    permissions:
-      id-token: write
     
     steps:
       - name: Checkout code
@@ -34,19 +33,33 @@ jobs:
       - name: Build package
         run: python -m build
       
-      - name: Publish with OIDC (try first)
+      # 1. Try OIDC (Trusted Publishing)
+      - name: Publish to PyPI (OIDC)
         id: oidc_publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        continue-on-error: true  # If this fails, we move to the next step
+
+      # 2. Try Token (Fallback)
+      # We removed the 'secrets' check from the 'if' condition to fix the error.
+      # If the secret is empty, this step will simply fail, triggering step 3.
+      - name: Publish to PyPI (Token Fallback)
+        id: token_publish
+        if: steps.oidc_publish.outcome == 'failure'
+        uses: pypa/gh-action-pypi-publish@release/v1
         continue-on-error: true
-        uses: pypa/gh-action-pypi-publish@release/v1
-      
-      - name: Publish with token (fallback)
-        if: steps.oidc_publish.outcome == 'failure' && secrets.PYPI_API_TOKEN != ''
-        uses: pypa/gh-action-pypi-publish@release/v1
         with:
           password: ${{ secrets.PYPI_API_TOKEN }}
-      
-      - name: Show manual instructions
-        if: steps.oidc_publish.outcome == 'failure' && secrets.PYPI_API_TOKEN == ''
+
+      # 3. Manual Instructions (If both failed)
+      - name: Failure Notification & Manual Instructions
+        if: steps.oidc_publish.outcome == 'failure' && steps.token_publish.outcome == 'failure'
         run: |
-          echo "❌ OIDC failed and no API token found"
-          echo "Manual upload: python -m twine upload dist/*"
+          echo "::error::❌ Automated publishing failed."
+          echo "---------------------------------------------------"
+          echo "1. OIDC (Trusted Publishing) failed."
+          echo "2. API Token fallback failed (Token missing or invalid)."
+          echo "---------------------------------------------------"
+          echo "To publish manually, run:"
+          echo "python -m pip install twine"
+          echo "python -m twine upload dist/*"
+          exit 1
