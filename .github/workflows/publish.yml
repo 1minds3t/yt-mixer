@@ -1,0 +1,52 @@
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  pypi-publish:
+    name: Upload release to PyPI
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/yt_mixer
+    permissions:
+      id-token: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build
+      
+      - name: Build package
+        run: python -m build
+      
+      - name: Publish with OIDC (try first)
+        id: oidc_publish
+        continue-on-error: true
+        uses: pypa/gh-action-pypi-publish@release/v1
+      
+      - name: Publish with token (fallback)
+        if: steps.oidc_publish.outcome == 'failure' && secrets.PYPI_API_TOKEN != ''
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+      
+      - name: Show manual instructions
+        if: steps.oidc_publish.outcome == 'failure' && secrets.PYPI_API_TOKEN == ''
+        run: |
+          echo "❌ OIDC failed and no API token found"
+          echo "Manual upload: python -m twine upload dist/*"
