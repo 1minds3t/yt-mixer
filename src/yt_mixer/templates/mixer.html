@@ -2,6 +2,7 @@
 <html>
 <head>
     <title>YT Mixer - Audio Playlist Mixer</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
     <style>
         body {
             background: #111;
@@ -121,6 +122,7 @@
             gap: 10px;
             justify-content: center;
             margin: 20px 0;
+            flex-wrap: wrap;
         }
         
         .controls button {
@@ -197,6 +199,26 @@
             from { transform: translateX(0); opacity: 1; }
             to { transform: translateX(100%); opacity: 0; }
         }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(4px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* ── RECENT SESSIONS ── */
+        .recent-sessions { margin-top:24px; border-top:1px solid #333; padding-top:20px; }
+        .recent-sessions h3 { font-size:13px; color:#888; margin:0 0 12px; text-transform:uppercase; letter-spacing:0.05em; }
+        .recent-session-item { display:flex; align-items:center; gap:10px; padding:10px 12px; background:#1a1a1a; border:1px solid #333; border-radius:8px; margin-bottom:8px; cursor:pointer; transition:border-color 0.15s,background 0.15s; }
+        .recent-session-item:hover { background:#222; border-color:#667eea55; }
+        .recent-session-icon { font-size:20px; flex-shrink:0; }
+        .recent-session-info { flex:1; min-width:0; }
+        .recent-session-label { font-size:12px; color:#ccc; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .recent-session-date { font-size:11px; color:#666; margin-top:2px; }
+        .recent-session-resume { background:linear-gradient(135deg,#667eea 0%,#764ba2 100%); color:white; border:none; padding:6px 14px; border-radius:5px; font-size:12px; font-weight:600; cursor:pointer; flex-shrink:0; white-space:nowrap; }
+        .recent-session-delete { background:none; border:none; color:#555; font-size:16px; cursor:pointer; padding:4px 6px; border-radius:4px; flex-shrink:0; transition:color 0.15s; }
+        .recent-session-delete:hover { color:#ff6b6b; }
+        .recovery-banner { display:none; background:#1a2a1a; border:1px solid #2d5a2d; border-left:3px solid #51cf66; border-radius:8px; padding:12px 16px; margin-bottom:16px; font-size:13px; color:#aaa; }
+        .recovery-banner.visible { display:flex; align-items:center; gap:10px; }
+        .recovery-banner strong { color:#51cf66; }
     </style>
 </head>
 <body>
@@ -204,6 +226,10 @@
     
     <!-- Setup Form (shown when no session) -->
     <div id="setup-form" class="setup-form">
+        <div class="recovery-banner" id="recovery-banner">
+            <span>🔄</span>
+            <span><strong>Reconnecting…</strong> Server restarted — rebuilding your session from saved playlists.</span>
+        </div>
         <h2>Create Your Mix</h2>
         <p style="color: #aaa; margin-bottom: 20px;">
             Enter two YouTube playlist IDs or full URLs to create your custom mix.
@@ -222,6 +248,10 @@
         </div>
         
         <button class="btn" onclick="createSession()">🚀 Create Mix</button>
+        <div class="recent-sessions" id="recent-sessions" style="display:none;">
+            <h3>📂 Recent Sessions</h3>
+            <div id="recent-sessions-list"></div>
+        </div>
     </div>
     
     <!-- Player Section (shown when session exists) -->
@@ -249,15 +279,18 @@
             <div id="error-content"></div>
         </div>
     </div>
-        <div id="logModal" style="display:none; position:fixed; z-index:1000; left:0; top:0; width:100%; height:100%; overflow:auto; background-color:rgba(0,0,0,0.7);">
-    <div style="background-color:#1e1e1e; color:#d4d4d4; margin:5% auto; padding:20px; border:1px solid #888; width:80%; height:80%; display:flex; flex-direction:column;">
-        <div style="display:flex; justify-content:space-between; align-items:center;">
-        <h2 style="margin:0;">🔴 Live Logs</h2>
-        <button onclick="closeLogView()" style="font-size:24px; background:none; border:none; color:white; cursor:pointer;">&times;</button>
+
+    <!-- Log modal -->
+    <div id="logModal" style="display:none; position:fixed; z-index:1000; left:0; top:0; width:100%; height:100%; overflow:auto; background-color:rgba(0,0,0,0.7);">
+        <div style="background-color:#1e1e1e; color:#d4d4d4; margin:5% auto; padding:20px; border:1px solid #888; width:80%; height:80%; display:flex; flex-direction:column;">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+                <h2 style="margin:0;">🔴 Live Logs</h2>
+                <button onclick="closeLogView()" style="font-size:24px; background:none; border:none; color:white; cursor:pointer;">&times;</button>
+            </div>
+            <pre id="logContent" style="flex-grow:1; overflow-y:scroll; background-color:#111; padding:10px; border-radius:5px; margin-top:10px; font-family:monospace; white-space:pre-wrap;"></pre>
         </div>
-        <pre id="logContent" style="flex-grow:1; overflow-y:scroll; background-color:#111; padding:10px; border-radius:5px; margin-top:10px; font-family:monospace; white-space:pre-wrap;"></pre>
     </div>
-    </div>
+
 
 
     <script>
@@ -286,22 +319,22 @@
                 const container = document.createElement('div');
                 container.id = 'mixing-progress';
                 container.style.cssText = `
-                    position: fixed;
-                    bottom: 80px;
-                    right: 20px;
-                    background: rgba(0, 0, 0, 0.9);
-                    color: #fff;
-                    padding: 15px;
-                    border-radius: 8px;
-                    max-width: 350px;
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-                    font-size: 13px;
-                    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
-                    z-index: 1000;
                     display: none;
+                    margin-top: 12px;
+                    padding: 12px;
+                    background: #111;
+                    border-radius: 6px;
+                    border: 1px solid #2a2a2a;
+                    font-size: 12px;
+                    color: #ccc;
                 `;
-                
-                document.body.appendChild(container);
+                // Inline inside status section, not floating overlay
+                const statusDiv = document.querySelector('.status');
+                if (statusDiv) {
+                    statusDiv.appendChild(container);
+                } else {
+                    document.body.appendChild(container);
+                }
                 this.progressContainer = container;
             }
 
@@ -370,7 +403,6 @@
                     Playing: Chunk ${status.chunk_index} ${qualityBadge}
                 </div>`;
                 
-                // Show LUFS queue status
                 if (status.lufs_in_progress && status.lufs_in_progress > 0) {
                     html += `<div style="margin-bottom: 12px; padding: 8px; background: rgba(255,165,0,0.2); border-radius: 4px; font-size: 11px;">
                         🔥 LUFS Processing: ${status.lufs_in_progress} chunk(s) - Chunks: ${(status.lufs_chunks || []).join(', ')}
@@ -386,7 +418,6 @@
                     
                     if (!isActive) continue;
                     
-                    // Highlight if this chunk is doing LUFS
                     const isLufs = progress.stage === 'final_mix';
                     const bgColor = isLufs ? 'rgba(255,165,0,0.15)' : 'rgba(255,255,255,0.05)';
                     const chunkLabel = isLufs ? `Chunk ${chunkIdx} 🔥` : `Chunk ${chunkIdx}`;
@@ -462,12 +493,19 @@
         let savedPosition = 0;
         let positionSaveInterval = null;
         let isInitialLoad = true;
-        document.addEventListener('DOMContentLoaded', () => {
-            if (sessionID) {
-                window.mixingMonitor = new MixingProgressMonitor();
-            }
-        });
-        // Save playback position every 5 seconds
+
+        // =========================================================
+        // VOLUME CONTROL
+        // Simple audio.volume — works perfectly on pre-mixed files.
+        // No Web Audio API needed (that's for live processing, not playback).
+        // =========================================================
+
+
+
+        // =========================================================
+        // PLAYBACK POSITION PERSISTENCE
+        // =========================================================
+
         function startPositionSaving() {
             if (positionSaveInterval) clearInterval(positionSaveInterval);
             
@@ -486,7 +524,6 @@
             }, 5000);
         }
 
-        // Load saved position from server
         async function loadSavedPosition() {
             if (!sessionID) return;
             
@@ -503,38 +540,113 @@
                 console.error('Failed to load saved position:', e);
             }
         }
+
         window.addEventListener('beforeunload', () => {
             if (window.mixingMonitor) {
                 window.mixingMonitor.destroy();
             }
         });
         
+        // =========================================================
+        // LOCAL SESSION PERSISTENCE
+        // =========================================================
+        const LS_KEY = 'yt_mixer_sessions';
+        const MAX_SAVED = 5;
+
+        function lsLoad() { try { return JSON.parse(localStorage.getItem(LS_KEY)) || []; } catch { return []; } }
+        function lsSave(s) { try { localStorage.setItem(LS_KEY, JSON.stringify(s)); } catch(e) {} }
+        function lsUpsert(sid, mu, su) {
+            const s = lsLoad().filter(x => x.sid !== sid);
+            s.unshift({ sid, musicUrl: mu, speechUrl: su, savedAt: Date.now() });
+            lsSave(s.slice(0, MAX_SAVED));
+        }
+        function lsRemove(sid) { lsSave(lsLoad().filter(s => s.sid !== sid)); renderRecent(); }
+        function lsFind(sid) { return lsLoad().find(s => s.sid === sid) || null; }
+
+        function relTime(ts) {
+            const m = Math.floor((Date.now() - ts) / 60000);
+            if (m < 2) return 'just now';
+            if (m < 60) return m + 'm ago';
+            const h = Math.floor(m / 60);
+            if (h < 24) return h + 'h ago';
+            return Math.floor(h / 24) + 'd ago';
+        }
+        function shortUrl(url) {
+            if (!url) return '—';
+            const m = url.match(/list=([^&]+)/);
+            if (m) return m[1].slice(0, 20) + (m[1].length > 20 ? '…' : '');
+            return url.slice(0, 28) + (url.length > 28 ? '…' : '');
+        }
+
+        function renderRecent() {
+            const sessions = lsLoad();
+            const panel = document.getElementById('recent-sessions');
+            const list  = document.getElementById('recent-sessions-list');
+            if (!sessions.length) { panel.style.display = 'none'; return; }
+            panel.style.display = 'block';
+            list.innerHTML = sessions.map(s => `
+                <div class="recent-session-item" onclick="resumeSession('${s.sid}')">
+                    <span class="recent-session-icon">🎵</span>
+                    <div class="recent-session-info">
+                        <div class="recent-session-label" title="${s.musicUrl} + ${s.speechUrl}">
+                            ${shortUrl(s.musicUrl)} &nbsp;+&nbsp; ${shortUrl(s.speechUrl)}
+                        </div>
+                        <div class="recent-session-date">${relTime(s.savedAt)} · <code style="font-size:10px">${s.sid}</code></div>
+                    </div>
+                    <button class="recent-session-resume" onclick="event.stopPropagation();resumeSession('${s.sid}')">▶ Resume</button>
+                    <button class="recent-session-delete" onclick="event.stopPropagation();lsRemove('${s.sid}')">✕</button>
+                </div>
+            `).join('');
+        }
+
+        async function resumeSession(sid) {
+            const saved = lsFind(sid);
+            if (!saved) { window.location.href = `/?sid=${sid}`; return; }
+            try {
+                const r = await fetch('/api/session/active');
+                const d = await r.json();
+                if (d.active && d.session_id === sid) { window.location.href = `/?sid=${sid}`; return; }
+            } catch(e) {}
+            document.getElementById('recovery-banner').classList.add('visible');
+            setTimeout(() => {
+                window.location.href = `/?m=${encodeURIComponent(saved.musicUrl)}&s=${encodeURIComponent(saved.speechUrl)}`;
+            }, 900);
+        }
+
+        function createSession() {
+            const musicId  = document.getElementById('music-input').value.trim();
+            const speechId = document.getElementById('speech-input').value.trim();
+            if (!musicId || !speechId) { alert('Please enter both playlist IDs'); return; }
+            try { localStorage.setItem('yt_mixer_pending', JSON.stringify({ musicUrl: musicId, speechUrl: speechId })); } catch(e) {}
+            window.location.href = `/?m=${encodeURIComponent(musicId)}&s=${encodeURIComponent(speechId)}`;
+        }
+
+        // ── Bootstrap ──────────────────────────────────────────────
         if (sessionID) {
             document.getElementById('setup-form').style.display = 'none';
             document.getElementById('player-section').classList.add('active');
-            
+
+            try {
+                const pending = JSON.parse(localStorage.getItem('yt_mixer_pending') || 'null');
+                if (pending && pending.musicUrl && pending.speechUrl) {
+                    lsUpsert(sessionID, pending.musicUrl, pending.speechUrl);
+                    localStorage.removeItem('yt_mixer_pending');
+                } else {
+                    const existing = lsFind(sessionID);
+                    if (existing) lsUpsert(sessionID, existing.musicUrl, existing.speechUrl);
+                }
+            } catch(e) {}
+
             const bookmarkDiv = document.getElementById('bookmark-info');
             bookmarkDiv.innerHTML = `
                 <strong>🔗 Bookmark this URL to return to your mix:</strong><br>
                 <a href="/?sid=${sessionID}">${window.location.origin}/?sid=${sessionID}</a>
             `;
-            
             initializePlayer();
         } else {
             document.getElementById('setup-form').style.display = 'block';
             document.getElementById('player-section').classList.remove('active');
-        }
-        
-        function createSession() {
-            const musicId = document.getElementById('music-input').value.trim();
-            const speechId = document.getElementById('speech-input').value.trim();
-            
-            if (!musicId || !speechId) {
-                alert('Please enter both playlist IDs');
-                return;
-            }
-            
-            window.location.href = `/?m=${encodeURIComponent(musicId)}&s=${encodeURIComponent(speechId)}`;
+            renderRecent();
         }
         
         async function initializePlayer() {
@@ -542,9 +654,35 @@
             startPositionSaving();
             updateStatus();
             setInterval(updateStatus, 10000);
+            // Auto-start as soon as a chunk is ready
+            autoStartWhenReady();
+        }
+
+        let autoStartAttempted = false;
+
+        async function autoStartWhenReady() {
+            if (autoStartAttempted) return;
+
+            // Poll every 3s until a chunk is available, then kick off playback
+            const poll = setInterval(async () => {
+                if (autoStartAttempted) { clearInterval(poll); return; }
+                try {
+                    const resp = await fetch('/api/status');
+                    if (!resp.ok) return;
+                    const data = await resp.json();
+                    const hasChunk = data.current_chunk || data.preloaded_count > 0;
+                    if (hasChunk) {
+                        clearInterval(poll);
+                        autoStartAttempted = true;
+                        console.log('Auto-start: chunk ready, loading...');
+                        loadChunk();
+                    }
+                } catch (e) { /* keep polling */ }
+            }, 3000);
         }
         
         function togglePlay() {
+            autoStartAttempted = true; // user is taking over, cancel auto-poll
             if (!audio.src || audio.src === '') {
                 loadChunk();
                 return;
@@ -555,7 +693,7 @@
                 bigPlayBtn.textContent = '▶';
                 isPlaying = false;
             } else {
-                audio.play().then(() => {
+                    audio.play().then(() => {
                     bigPlayBtn.textContent = '⏸';
                     isPlaying = true;
                 }).catch(err => {
@@ -577,10 +715,13 @@
         
         function loadChunk() {
             statusContent.innerHTML = '<span class="success">Loading audio...</span>';
-            
+
+            // Reset error state before loading new src
+            audio.removeAttribute('src');
+            audio.load();
+
             audio.src = `/stream?t=${Date.now()}`;
 
-            // Restore saved position on first load
             if (isInitialLoad && savedPosition > 0) {
                 audio.addEventListener('loadedmetadata', function restorePos() {
                     audio.currentTime = savedPosition;
@@ -592,7 +733,7 @@
             audio.load();
             
             audio.oncanplaythrough = () => {
-                audio.play().then(() => {
+                    audio.play().then(() => {
                     bigPlayBtn.textContent = '⏸';
                     isPlaying = true;
                     updateStatus();
@@ -614,11 +755,11 @@
                 .then(r => r.json())
                 .then(data => {
                     if (data.success) {
-                    currentChunkIndex = data.chunk_index;
-                    savedPosition = 0; // Reset for new chunk
-                    setTimeout(() => {
-                        loadChunk();
-                    }, 500);
+                        currentChunkIndex = data.chunk_index;
+                        savedPosition = 0;
+                        setTimeout(() => {
+                            loadChunk();
+                        }, 500);
                     } else {
                         statusContent.innerHTML = `<span class="error">No next chunk available: ${data.error || 'Still preparing'}</span>`;
                     }
@@ -670,7 +811,6 @@
         }
 
         function showLogs() {
-            // Use the existing viewLogs() function which shows modal
             viewLogs();
         }
 
@@ -681,13 +821,11 @@
             modal.style.display = 'block';
             content.innerHTML = 'Loading logs...\n';
 
-            // Simple fetch, no SSE
             fetch('/api/logs')
                 .then(r => r.json())
                 .then(data => {
                     if (data.logs && data.logs.length > 0) {
                         content.innerHTML = data.logs.join('');
-                        // Auto-scroll to bottom
                         content.scrollTop = content.scrollHeight;
                     } else {
                         content.innerHTML = 'No logs available\n';

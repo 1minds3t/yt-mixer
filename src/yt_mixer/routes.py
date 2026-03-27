@@ -111,6 +111,25 @@ def list_sessions():
     sessions = manager.list_sessions()
     return jsonify(sessions=sessions)
 
+@app.route('/api/client-log', methods=['POST'])
+def client_log():
+    """Receive browser/mobile console logs and write them to the server log file.
+    This is the only way to see what's happening on iOS where DevTools aren't available."""
+    data = request.get_json(silent=True) or {}
+    level   = data.get('level', 'info').lower()
+    message = data.get('message', '')
+    if not message:
+        return jsonify(ok=True)
+    prefix = f"[CLIENT-{level.upper()}]"
+    if level == 'error':
+        log.error(f"{prefix} {message}")
+    elif level == 'warn':
+        log.warning(f"{prefix} {message}")
+    else:
+        log.info(f"{prefix} {message}")
+    return jsonify(ok=True)
+
+
 @app.route('/api/logs')
 def get_recent_logs():
     """Get recent log entries for debugging"""
@@ -207,6 +226,158 @@ def stream_by_session(sid):
     return stream_current()
 
 # ============================================================================
+# VIDEO ROUTES
+# ============================================================================
+
+@app.route('/api/video/resolve', methods=['POST'])
+def resolve_video():
+    """
+    Resolve a YouTube video URL to metadata for the video overlay panel.
+    Returns: video_id, title, thumbnail, duration, has_captions.
+    The client uses video_id to build a muted iframe embed (YouTube player),
+    so we get CC + YouTube UI for free without any audio routing on the server.
+    """
+    import yt_dlp
+
+    data = request.get_json()
+    url = (data or {}).get('url', '').strip()
+
+    if not url:
+        return jsonify(error="Missing url"), 400
+
+    # Accept full URLs or bare video IDs
+    if not url.startswith('http'):
+        url = f'https://www.youtube.com/watch?v={url}'
+
+    # Strip tracking params
+    if '&si=' in url:
+        url = url.split('&si=')[0]
+
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'skip_download': True,
+        'extract_flat': False,
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        if not info:
+            return jsonify(error="Could not extract video info"), 400
+
+        video_id = info.get('id')
+        title = info.get('title', 'Unknown')
+        duration = info.get('duration', 0)
+        thumbnail = info.get('thumbnail', '')
+        # Check for subtitles/captions
+        subtitles = info.get('subtitles', {})
+        auto_captions = info.get('automatic_captions', {})
+        has_captions = bool(subtitles) or bool(auto_captions)
+        caption_langs = list(subtitles.keys()) + [f"{k} (auto)" for k in auto_captions.keys()]
+
+        log.info(f"Resolved video: {video_id} - {title} ({duration}s) captions={has_captions}")
+
+        return jsonify(
+            video_id=video_id,
+            title=title,
+            duration=duration,
+            thumbnail=thumbnail,
+            has_captions=has_captions,
+            caption_langs=caption_langs[:5],  # first 5 for display
+        )
+
+    except Exception as e:
+        log.error(f"Video resolve error: {e}")
+        return jsonify(error=str(e)), 500
+
+
+@app.route('/api/video/stream-url', methods=['POST'])
+def video_stream_url():
+    """
+    Extract a direct streamable video URL for a YouTube video.
+    Returns the best combined video+audio stream URL that the browser
+    can use as a <video src="..."> directly — no download, no proxy.
+    Also returns metadata (title, duration, thumbnail) in one call.
+    """
+    import yt_dlp
+
+    data = request.get_json()
+    url = (data or {}).get('url', '').strip()
+
+    if not url:
+        return jsonify(error="Missing url"), 400
+
+    if not url.startswith('http'):
+        url = f'https://www.youtube.com/watch?v={url}'
+
+    # Normalise: strip tracking/playlist params, keep only video
+    from urllib.parse import urlparse, parse_qs, urlencode
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
+    vid = (qs.get('v') or [None])[0]
+    if vid:
+        url = f'https://www.youtube.com/watch?v={vid}'
+
+    # Extract video-only stream + audio-only stream separately.
+    # Video element plays muted. Audio element plays the audio stream.
+    # This gives iOS two native <audio> elements we fully control,
+    # instead of one <video> that iOS audio session treats as king.
+    ydl_opts_video = {
+        'quiet': True,
+        'no_warnings': True,
+        'skip_download': True,
+        'format': 'bestvideo[ext=mp4]/bestvideo',
+    }
+    ydl_opts_audio = {
+        'quiet': True,
+        'no_warnings': True,
+        'skip_download': True,
+        'format': 'bestaudio[ext=m4a]/bestaudio',
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts_video) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        if not info:
+            return jsonify(error="Could not extract video info"), 400
+
+        stream_url = info.get('url')
+        if not stream_url:
+            return jsonify(error="Could not extract video stream URL"), 400
+
+        # Extract audio-only stream
+        with yt_dlp.YoutubeDL(ydl_opts_audio) as ydl:
+            audio_info = ydl.extract_info(url, download=False)
+        audio_url = audio_info.get('url') if audio_info else None
+
+        video_id  = info.get('id', '')
+        title     = info.get('title', 'Unknown')
+        duration  = info.get('duration', 0)
+        thumbnail = info.get('thumbnail', '')
+        subtitles = info.get('subtitles', {})
+        auto_captions = info.get('automatic_captions', {})
+        has_captions = bool(subtitles) or bool(auto_captions)
+
+        log.info(f"Stream URL extracted: {video_id} - {title} ({duration}s) audio={'yes' if audio_url else 'no'}")
+
+        return jsonify(
+            stream_url=stream_url,
+            audio_url=audio_url,
+            video_id=video_id,
+            title=title,
+            duration=duration,
+            thumbnail=thumbnail,
+            has_captions=has_captions,
+        )
+
+    except Exception as e:
+        log.error(f"Video stream-url error: {e}")
+        return jsonify(error=str(e)), 500
+
+# ============================================================================
 # PLAYBACK CONTROL ROUTES
 # ============================================================================
 
@@ -265,8 +436,6 @@ def delete_session(sid):
     except Exception as e:
         log.error(f"Error deleting session {sid}: {e}")
         return jsonify(success=False, error=str(e)), 500
-
-# Add these new routes to routes.py (around line 150, before the session management section)
 
 # ============================================================================
 # PLAYBACK STATE PERSISTENCE ROUTES

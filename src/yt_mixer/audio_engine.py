@@ -70,13 +70,34 @@ class AudioWorker:
             })
             self.error_log = self.error_log[-10:]
 
+    def _normalize_playlist_url(self, url):
+        """
+        Accept any YouTube URL format and return a clean playlist?list= URL.
+        Handles watch?v=X&list=PL, youtu.be, bare IDs, &pp=, &si= garbage, etc.
+        """
+        from urllib.parse import urlparse, parse_qs
+        url = url.strip()
+
+        # Bare playlist ID (no slashes or dots)
+        if url and "/" not in url and "." not in url:
+            return f"https://www.youtube.com/playlist?list={url}"
+
+        try:
+            parsed = urlparse(url)
+            qs = parse_qs(parsed.query)
+            list_id = (qs.get("list") or [None])[0]
+            if list_id:
+                return f"https://www.youtube.com/playlist?list={list_id}"
+            log.warning(f"[{self.session_id}] No list= param in URL: {url}")
+            return url
+        except Exception as e:
+            log.warning(f"[{self.session_id}] URL normalisation failed ({e}), using raw: {url}")
+            return url
+
     def get_video_ids(self, playlist_url, max_fetch=None):
-        """Extract video IDs"""
-        if "&si=" in playlist_url:
-            playlist_url = playlist_url.split("&si=")[0]
-        if "youtube.com" not in playlist_url:
-            playlist_id = playlist_url.split("&")[0]
-            playlist_url = f"https://www.youtube.com/playlist?list={playlist_id}"
+        """Extract video IDs from any YouTube playlist URL format."""
+        playlist_url = self._normalize_playlist_url(playlist_url)
+        log.info(f"[{self.session_id}] Fetching playlist: {playlist_url}")
         
         ydl_opts = {
             'quiet': True,
