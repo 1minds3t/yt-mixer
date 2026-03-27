@@ -278,6 +278,60 @@
             <h3>⚠️ Recent Errors</h3>
             <div id="error-content"></div>
         </div>
+
+        <!-- Ad-hoc YouTube Audio Injection Panel -->
+        <div id="adhoc-panel" style="
+            background: #1a1a2e;
+            border: 1px solid #444;
+            border-radius: 10px;
+            padding: 20px;
+            margin-top: 20px;
+        ">
+            <h3 style="margin:0 0 14px; color:#a78bfa; font-size:14px; text-transform:uppercase; letter-spacing:.05em;">
+                🎬 Add Video Audio
+            </h3>
+
+            <!-- URL input row -->
+            <div id="adhoc-input-row" style="display:flex; gap:8px; margin-bottom:12px;">
+                <input id="adhoc-url" type="text"
+                    placeholder="YouTube URL or video ID"
+                    style="flex:1; background:#222; border:1px solid #555; border-radius:6px;
+                           color:#eee; padding:10px 12px; font-size:13px; outline:none;"
+                    onkeydown="if(event.key==='Enter') adhocSubmit()"
+                />
+                <button onclick="adhocSubmit()" style="
+                    background:linear-gradient(135deg,#7c3aed,#a855f7);
+                    color:white; border:none; border-radius:6px;
+                    padding:10px 18px; font-size:13px; cursor:pointer; white-space:nowrap;">
+                    ▶ Prepare
+                </button>
+            </div>
+
+            <!-- Status / progress line -->
+            <div id="adhoc-status" style="
+                font-size:12px; color:#9ca3af; min-height:18px; margin-bottom:10px;">
+            </div>
+
+            <!-- Action buttons (hidden until relevant) -->
+            <div id="adhoc-actions" style="display:none; gap:8px; flex-wrap:wrap;">
+                <button id="adhoc-play-btn" onclick="adhocPlay()" style="display:none;
+                    background:linear-gradient(135deg,#059669,#10b981);
+                    color:white; border:none; border-radius:6px;
+                    padding:12px 24px; font-size:15px; font-weight:bold; cursor:pointer;">
+                    ▶ Play with video audio
+                </button>
+                <button id="adhoc-exit-btn" onclick="adhocExit()" style="display:none;
+                    background:#374151; color:#d1d5db; border:none; border-radius:6px;
+                    padding:10px 18px; font-size:13px; cursor:pointer;">
+                    ⏹ Stop &amp; resume background
+                </button>
+                <button id="adhoc-cancel-btn" onclick="adhocCancel()" style="display:none;
+                    background:#1f2937; color:#9ca3af; border:none; border-radius:6px;
+                    padding:10px 14px; font-size:12px; cursor:pointer;">
+                    ✕ Cancel
+                </button>
+            </div>
+        </div>
     </div>
 
     <!-- Log modal -->
@@ -868,6 +922,278 @@
                 setTimeout(() => notification.remove(), 300);
             }, 3000);
         });
+
+        // =========================================================
+        // AD-HOC YOUTUBE AUDIO INJECTION
+        // =========================================================
+
+        const adhocState = {
+            jobId:        null,
+            pollTimer:    null,
+            anchorSec:    null,   // absolute_sec at freeze moment
+            isPlaying:    false,  // true while adhoc audio is the active source
+        };
+
+        function adhocSetStatus(msg, color='#9ca3af') {
+            const el = document.getElementById('adhoc-status');
+            if (el) { el.textContent = msg; el.style.color = color; }
+        }
+
+        function adhocShowButtons(...ids) {
+            const row = document.getElementById('adhoc-actions');
+            if (row) row.style.display = ids.length ? 'flex' : 'none';
+            ['adhoc-play-btn','adhoc-exit-btn','adhoc-cancel-btn'].forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.style.display = ids.includes(id) ? '' : 'none';
+            });
+        }
+
+        function adhocGetAbsoluteSec() {
+            // Best client-side estimate: chunk_index * 3600 + current offset
+            return currentChunkIndex * 3600 + (audio.currentTime || 0);
+        }
+
+        async function adhocSubmit() {
+            const url = document.getElementById('adhoc-url').value.trim();
+            if (!url) return;
+            if (!sessionID) { adhocSetStatus('No active session.', '#ef4444'); return; }
+
+            // Cancel any existing job first
+            if (adhocState.jobId) await adhocCancel(true);
+
+            adhocSetStatus('⏳ Submitting…');
+            adhocShowButtons('adhoc-cancel-btn');
+            document.getElementById('adhoc-url').disabled = true;
+
+            try {
+                const resp = await fetch('/api/adhoc/prepare', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url, session_id: sessionID })
+                });
+                const data = await resp.json();
+                if (!resp.ok) throw new Error(data.error || resp.statusText);
+
+                adhocState.jobId = data.job_id;
+                adhocSetStatus('🎵 Downloading video audio in background…', '#a78bfa');
+                adhocStartPolling();
+            } catch(e) {
+                adhocSetStatus(`Error: ${e.message}`, '#ef4444');
+                adhocShowButtons();
+                document.getElementById('adhoc-url').disabled = false;
+            }
+        }
+
+        function adhocStartPolling() {
+            if (adhocState.pollTimer) clearInterval(adhocState.pollTimer);
+            adhocState.pollTimer = setInterval(adhocPoll, 3000);
+            adhocPoll();
+        }
+
+        function adhocStopPolling() {
+            if (adhocState.pollTimer) {
+                clearInterval(adhocState.pollTimer);
+                adhocState.pollTimer = null;
+            }
+        }
+
+        async function adhocPoll() {
+            if (!adhocState.jobId) { adhocStopPolling(); return; }
+            try {
+                const resp = await fetch(`/api/adhoc/status/${adhocState.jobId}`);
+                const data = await resp.json();
+                adhocHandleStatus(data);
+            } catch(e) {
+                console.error('adhoc poll error', e);
+            }
+        }
+
+        async function adhocHandleStatus(data) {
+            const { status, title, duration, error } = data;
+            const mins = duration
+                ? `${Math.floor(duration/60)}m${Math.floor(duration%60)}s`
+                : '';
+
+            switch(status) {
+                case 'preparing_external':
+                    adhocSetStatus(`⏳ Downloading: ${title || '…'} ${mins}`, '#a78bfa');
+                    adhocShowButtons('adhoc-cancel-btn');
+                    break;
+
+                case 'finalizing':
+                    // Phase A done — pause audio, snapshot position, trigger Phase B
+                    adhocStopPolling();
+                    adhocSetStatus(`✅ Download done (${title || ''}). Mixing…`, '#fbbf24');
+                    adhocShowButtons();
+                    await adhocTriggerPhaseB();
+                    break;
+
+                case 'rendering':
+                    adhocSetStatus('🔀 Mixing streams…', '#fbbf24');
+                    break;
+
+                case 'ready':
+                    adhocStopPolling();
+                    adhocSetStatus(`✅ Mix ready: ${title || ''} ${mins}`, '#10b981');
+                    adhocShowButtons('adhoc-play-btn', 'adhoc-cancel-btn');
+                    break;
+
+                case 'failed':
+                    adhocStopPolling();
+                    adhocSetStatus(`❌ Prep failed: ${error || 'unknown error'}`, '#ef4444');
+                    adhocShowButtons();
+                    adhocReset();
+                    break;
+
+                case 'finalize_failed':
+                    adhocStopPolling();
+                    adhocSetStatus(`❌ Mix failed: ${error || 'unknown error'}`, '#ef4444');
+                    adhocShowButtons();
+                    // Resume background from the moment we froze audio
+                    if (adhocState.anchorSec !== null) {
+                        adhocResumeBackground(adhocState.anchorSec);
+                    }
+                    adhocReset();
+                    break;
+
+                case 'cancelled':
+                case 'done':
+                    adhocStopPolling();
+                    adhocReset();
+                    break;
+            }
+        }
+
+        async function adhocTriggerPhaseB() {
+            // One and only pause — snapshot exact position
+            audio.pause();
+            const absoluteSec = adhocGetAbsoluteSec();
+            adhocState.anchorSec = absoluteSec;
+
+            adhocSetStatus('🔀 Rendering mix (background sliced, audio paused)…', '#fbbf24');
+
+            try {
+                const resp = await fetch(`/api/adhoc/finalize/${adhocState.jobId}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ absolute_sec: absoluteSec })
+                });
+                const data = await resp.json();
+                if (!resp.ok) throw new Error(data.error || resp.statusText);
+                adhocHandleStatus({ status: data.status, title: data.title, duration: data.duration });
+            } catch(e) {
+                adhocSetStatus(`❌ Mix failed: ${e.message}`, '#ef4444');
+                adhocResumeBackground(adhocState.anchorSec);
+                adhocReset();
+            }
+        }
+
+        function adhocPlay() {
+            if (!adhocState.jobId) return;
+            adhocState.isPlaying = true;
+
+            // Swap the audio element's source to the pre-mixed file
+            audio.pause();
+            audio.src = `/api/adhoc/stream/${adhocState.jobId}?t=${Date.now()}`;
+            audio.load();
+            audio.oncanplaythrough = () => {
+                audio.play().catch(e => console.error('adhoc play error', e));
+                adhocSetStatus('▶ Playing video audio…', '#10b981');
+                adhocShowButtons('adhoc-exit-btn');
+                audio.oncanplaythrough = null;
+            };
+            // Auto-exit when the mix finishes naturally
+            audio.onended = () => {
+                if (adhocState.isPlaying) adhocExit();
+                else nextChunk();
+            };
+        }
+
+        async function adhocExit() {
+            adhocStopPolling();
+            const playedSec = adhocState.isPlaying ? (audio.currentTime || 0) : 0;
+            adhocState.isPlaying = false;
+
+            audio.pause();
+            adhocSetStatus('⏹ Stopping, resuming background…', '#9ca3af');
+            adhocShowButtons();
+
+            if (adhocState.jobId) {
+                try {
+                    const resp = await fetch(`/api/adhoc/deactivate/${adhocState.jobId}`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ played_seconds: playedSec })
+                    });
+                    const data = await resp.json();
+                    adhocResumeBackground(
+                        data.resume_absolute_sec !== undefined
+                            ? data.resume_absolute_sec
+                            : (adhocState.anchorSec || 0)
+                    );
+                } catch(e) {
+                    console.error('deactivate error', e);
+                    adhocResumeBackground(adhocState.anchorSec || 0);
+                }
+            }
+
+            adhocReset();
+        }
+
+        async function adhocCancel(silent=false) {
+            adhocStopPolling();
+            const jobId = adhocState.jobId;
+            if (jobId) {
+                try {
+                    await fetch(`/api/adhoc/cancel/${jobId}`, { method: 'POST' });
+                } catch(e) {}
+            }
+            if (!silent) {
+                adhocSetStatus('Cancelled.', '#6b7280');
+                adhocShowButtons();
+            }
+            adhocReset();
+        }
+
+        function adhocResumeBackground(absoluteSec) {
+            // Restore the normal chunk-end handler
+            audio.onended = () => nextChunk();
+
+            // Convert absolute seconds back to chunk index + seek offset
+            const CHUNK_DUR = 3600;
+            currentChunkIndex = Math.floor(absoluteSec / CHUNK_DUR);
+            const offset = absoluteSec % CHUNK_DUR;
+
+            audio.removeAttribute('src');
+            audio.load();
+            audio.src = `/stream?t=${Date.now()}`;
+            audio.load();
+
+            audio.addEventListener('loadedmetadata', function seekBack() {
+                if (offset > 0 && audio.duration > offset) {
+                    audio.currentTime = offset;
+                }
+                audio.removeEventListener('loadedmetadata', seekBack);
+            });
+
+            audio.oncanplaythrough = () => {
+                audio.play().then(() => {
+                    adhocSetStatus('', '#9ca3af');
+                    document.getElementById('adhoc-url').value = '';
+                    document.getElementById('adhoc-url').disabled = false;
+                }).catch(e => console.error('resume play error', e));
+                audio.oncanplaythrough = null;
+            };
+        }
+
+        function adhocReset() {
+            adhocState.jobId     = null;
+            adhocState.anchorSec = null;
+            adhocState.isPlaying = false;
+            adhocShowButtons();
+            document.getElementById('adhoc-url').disabled = false;
+        }
+
     </script>
 </body>
 </html>

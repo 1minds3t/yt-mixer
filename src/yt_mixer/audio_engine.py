@@ -542,6 +542,33 @@ class AudioWorker:
                     if immediate_path:
                         Path(immediate_path).unlink(missing_ok=True)
                     log.info(f"[{self.session_id}] ✓ Upgraded to QUICK mix")
+
+                    # ── Save music-only chunk for ad-hoc video audio mode ──
+                    # When video_engine needs a music-only background (no speech),
+                    # it slices from {index}_music.mp3 instead of the full mixed chunk.
+                    # We produce it here from the already-normalized m_concat, so
+                    # there's no extra ffprobe or download — just a fast loudnorm pass.
+                    music_only_path = self.my_chunk_dir / f"{index}_music.mp3"
+                    try:
+                        music_filter = (
+                            '[0:a]loudnorm=I=-16:TP=-1.5:LRA=11[m_out]'
+                        )
+                        result_m = subprocess.run(
+                            ['ffmpeg', '-y', '-i', str(m_concat),
+                             '-filter_complex', music_filter,
+                             '-map', '[m_out]',
+                             '-c:a', 'libmp3lame', '-b:a', '128k',
+                             str(music_only_path)],
+                            capture_output=True, timeout=600
+                        )
+                        if result_m.returncode == 0 and music_only_path.exists():
+                            log.info(f"[{self.session_id}] 🎵 Music-only chunk saved: {music_only_path.name}")
+                        else:
+                            log.warning(f"[{self.session_id}] Music-only chunk failed, falling back to copy")
+                            import shutil as _sh
+                            _sh.copy2(m_concat, music_only_path)
+                    except Exception as e_m:
+                        log.warning(f"[{self.session_id}] Music-only chunk error: {e_m}")
                     
                     # FINAL mix - ONLY if not too many in progress
                     with self.lock:

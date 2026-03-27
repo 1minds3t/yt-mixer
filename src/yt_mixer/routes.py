@@ -377,6 +377,163 @@ def video_stream_url():
         log.error(f"Video stream-url error: {e}")
         return jsonify(error=str(e)), 500
 
+from . import video_engine as _ve
+from .video_engine import ConflictError, NotFoundError, StateError
+ 
+@app.route('/api/adhoc/prepare', methods=['POST'])
+def adhoc_prepare():
+    """
+    Phase A — validate URL, start background download.
+    Body: { "url": "<youtube url or video id>", "session_id": "<sid>" }
+    Returns: { "job_id": "...", "status": "preparing_external" }
+    """
+    data       = request.get_json() or {}
+    url        = data.get('url', '').strip()
+    session_id = data.get('session_id', '').strip()
+ 
+    if not url:
+        return jsonify(error="Missing url"), 400
+    if not session_id:
+        return jsonify(error="Missing session_id"), 400
+ 
+    # Verify session exists
+    active = manager.get_active_session()
+    if not active or active[0] != session_id:
+        return jsonify(error="Session not active"), 404
+ 
+    try:
+        result = _ve.prepare_job(session_id, url)
+        return jsonify(result), 202
+    except ConflictError as e:
+        return jsonify(error=str(e)), 409
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    except Exception as e:
+        log.error(f"adhoc_prepare error: {e}")
+        return jsonify(error=str(e)), 500
+ 
+ 
+@app.route('/api/adhoc/status/<job_id>')
+def adhoc_status(job_id):
+    """
+    Poll this every 3 seconds.
+    Returns: { job_id, status, title, duration, error? }
+    Statuses:
+      preparing_external  → Phase A running (audio keeps playing)
+      finalizing          → Phase A done; client should pause + POST to /finalize
+      rendering           → Phase B running
+      ready               → final_mix.mp3 ready; show Play button
+      failed              → Phase A failed; audio never interrupted
+      finalize_failed     → Phase B failed; client should resume from anchor
+      cancelled           → user cancelled
+    """
+    try:
+        status = _ve.get_job_status(job_id)
+        return jsonify({
+            "job_id":   status["job_id"],
+            "status":   status["status"],
+            "title":    status.get("title"),
+            "duration": status.get("duration"),
+            "error":    status.get("error"),
+        })
+    except NotFoundError as e:
+        return jsonify(error=str(e)), 404
+    except Exception as e:
+        return jsonify(error=str(e)), 500
+ 
+ 
+@app.route('/api/adhoc/finalize/<job_id>', methods=['POST'])
+def adhoc_finalize(job_id):
+    """
+    Phase B — client sends its current absolute timeline position.
+    Server slices the background, mixes it with YT audio, produces final_mix.mp3.
+ 
+    Body: { "absolute_sec": <float> }
+ 
+    On success: { status: "ready", job_id, anchor_absolute_sec }
+    On failure: { status: "finalize_failed", error }
+    """
+    data = request.get_json() or {}
+ 
+    try:
+        absolute_sec = float(data['absolute_sec'])
+    except (KeyError, TypeError, ValueError):
+        return jsonify(error="Missing or invalid absolute_sec"), 400
+ 
+    try:
+        status = _ve.get_job_status(job_id)
+    except NotFoundError as e:
+        return jsonify(error=str(e)), 404
+ 
+    session_id = status.get("session_id")
+    chunk_dir  = manager.get_chunk_dir_for_session(session_id)
+ 
+    try:
+        result = _ve.finalize_job(job_id, absolute_sec, chunk_dir)
+        return jsonify(result)
+    except StateError as e:
+        return jsonify(error=str(e)), 409
+    except Exception as e:
+        log.error(f"adhoc_finalize error: {e}")
+        return jsonify(error=str(e), status="finalize_failed"), 500
+ 
+ 
+@app.route('/api/adhoc/stream/<job_id>')
+def adhoc_stream(job_id):
+    """
+    Serve the final mixed .mp3 for the <audio> element.
+    The client sets audio.src = this URL after seeing status = "ready".
+    """
+    try:
+        path = _ve.stream_path(job_id)
+        return send_file(path, mimetype='audio/mpeg')
+    except (NotFoundError, StateError) as e:
+        return jsonify(error=str(e)), 404
+    except Exception as e:
+        log.error(f"adhoc_stream error: {e}")
+        return jsonify(error=str(e)), 500
+ 
+ 
+@app.route('/api/adhoc/deactivate/<job_id>', methods=['POST'])
+def adhoc_deactivate(job_id):
+    """
+    User finished listening to the ad-hoc mix.
+    Body: { "played_seconds": <float> }
+ 
+    Returns: { "resume_absolute_sec": <float> }
+    Route advances the session timeline, client switches back to /stream.
+    """
+    data = request.get_json() or {}
+    played = float(data.get('played_seconds', 0))
+ 
+    try:
+        result = _ve.deactivate_job(job_id, played)
+    except (NotFoundError, StateError) as e:
+        return jsonify(error=str(e)), 404
+    except Exception as e:
+        return jsonify(error=str(e)), 500
+ 
+    # Persist the advanced position to session_manager so /stream resumes correctly
+    try:
+        status     = _ve.get_job_status(job_id)
+        session_id = status.get("session_id")
+        if session_id:
+            manager.advance_timeline_to(session_id, result["resume_absolute_sec"])
+    except Exception as e:
+        log.warning(f"Could not advance timeline: {e}")
+ 
+    return jsonify(result)
+ 
+ 
+@app.route('/api/adhoc/cancel/<job_id>', methods=['POST'])
+def adhoc_cancel(job_id):
+    """Kill Phase A subprocess if running, clean up, restore user to audio mode."""
+    try:
+        _ve.cancel_job(job_id)
+        return jsonify(ok=True)
+    except Exception as e:
+        return jsonify(error=str(e)), 500
+ 
 # ============================================================================
 # PLAYBACK CONTROL ROUTES
 # ============================================================================

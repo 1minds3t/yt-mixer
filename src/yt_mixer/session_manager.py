@@ -345,6 +345,32 @@ class SessionManager:
                 log.info(f"Pruning old session: {session_dir.name} (age: {age/86400:.1f} days)")
                 self.delete_session(session_dir.name)
     
+    def get_chunk_dir_for_session(self, session_id):
+        """Return the Path to the mixed chunks directory for this session."""
+        return CHUNK_DIR / session_id
+
+    def get_absolute_timeline_sec(self, session_id):
+        """
+        Convert persisted chunk_index + position_seconds into a single
+        absolute timeline value in seconds.
+        chunk_index * 3600 + position_seconds
+        """
+        state     = self.get_playback_position(session_id)
+        chunk_idx = state.get('chunk_index', 0)
+        offset    = state.get('position_seconds', 0.0)
+        return chunk_idx * 3600 + offset
+
+    def advance_timeline_to(self, session_id, absolute_sec):
+        """
+        After ad-hoc audio exits, commit the new position.
+        Converts absolute_sec back to (chunk_index, offset) and persists it.
+        """
+        chunk_idx = int(absolute_sec // 3600)
+        offset    = absolute_sec % 3600
+        log.info(f"[{session_id}] Timeline advanced to abs={absolute_sec:.1f}s "
+                 f"-> chunk {chunk_idx}, offset {offset:.1f}s")
+        self.update_playback_position(session_id, chunk_idx, offset)
+
     def shutdown(self):
         """Gracefully shutdown all workers"""
         log.info("Shutting down SessionManager...")
@@ -362,3 +388,7 @@ class SessionManager:
 
 # Global instance
 manager = SessionManager()
+
+# Wire up the ad-hoc video engine with correct paths
+from . import video_engine as _ve
+_ve.init(DATA_DIR, CHUNK_DIR, AUDIO_DIR)
