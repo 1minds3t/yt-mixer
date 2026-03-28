@@ -1,48 +1,74 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "yt_mixer"
-version = "0.1.0"
-description = "Server-side YouTube Audio Mixer with Ducking and Podcast Processing"
+version = "0.2.0"
+description = "Server-side YouTube Audio Mixer with ad-hoc video injection, LUFS normalization, and podcast-style ducking"
 readme = "README.md"
 requires-python = ">=3.8"
-license = {text = "MIT"}
+license = {text = "AGPL-3.0"}
 authors = [
     {name = "1minds3t", email = "1minds3t@proton.me"}
 ]
-keywords = ["youtube", "audio", "mixer", "podcast", "ffmpeg"]
+keywords = ["youtube", "audio", "mixer", "podcast", "ffmpeg", "video", "yt-dlp"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: End Users/Desktop",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: GNU Affero General Public License v3",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Multimedia :: Sound/Audio",
+    "Topic :: Multimedia :: Video",
 ]
-
 dependencies = [
     "Flask>=3.0.0",
     "yt-dlp>=2024.0.0",
-    "eventlet>=0.33.0"
+    "eventlet>=0.33.0",
+]
+
+[project.optional-dependencies]
+full = ["omnipkg"]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "black>=23.0",
+    "ruff>=0.1.0",
 ]
 
 [project.scripts]
 yt-mixer = "yt_mixer.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/1minds3t/yt_mixer"
-Issues = "https://github.com/1minds3t/yt_mixer/issues"
+Homepage = "https://github.com/1minds3t/yt-mixer"
+Repository = "https://github.com/1minds3t/yt-mixer"
+Issues = "https://github.com/1minds3t/yt-mixer/issues"
 
 [tool.setuptools]
 license-files = ["LICENSE", "THIRD_PARTY_NOTICES.txt"]
+package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
 yt_mixer = ["templates/*.html"]
+
+[tool.black]
+line-length = 100
+target-version = ['py38']
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "W", "I"]
+ignore = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]

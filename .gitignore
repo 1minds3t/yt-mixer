@@ -87,3 +87,21 @@ htmlcov/
 # gitship diff exports (auto-added by gitship)
 gitship_exports/
 data/adhoc_jobs/
+
+# Auto-generated license files
+licenses/
+
+# Dependencies
+node_modules/
+
+# Logs
+npm-debug.log*
+
+# Logs
+yarn-debug.log*
+
+# Logs
+yarn-error.log*
+
+# npm
+.npm

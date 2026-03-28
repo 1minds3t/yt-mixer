@@ -3,6 +3,7 @@
 # Core documentation and license files
 include README.md
 include LICENSE
+include CHANGELOG.md
 include THIRD_PARTY_NOTICES.txt
 
 # Third-party license files
