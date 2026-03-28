@@ -1,0 +1,6 @@
+site_name: yt_mixer
+site_description: Documentation for yt_mixer
+theme:
+  name: material       # or: readthedocs / mkdocs
+docs_dir: docs
+site_dir: site
