@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Video</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body { background: #000; width: 100%; height: 100%; overflow: hidden; }
+        #v { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+        #tap {
+            position: fixed; inset: 0; z-index: 999;
+            display: flex; flex-direction: column;
+            align-items: center; justify-content: center; gap: 12px;
+            background: rgba(0,0,0,0.7); cursor: pointer;
+            -webkit-tap-highlight-color: transparent;
+            user-select: none; -webkit-user-select: none;
+        }
+        #tap .icon { font-size: 80px; }
+        #tap .label { font-family: -apple-system, sans-serif; font-size: 22px; font-weight: 700; color: #fff; }
+        #tap .sub { font-family: -apple-system, sans-serif; font-size: 13px; color: #999; text-align: center; padding: 0 20px; }
+        #bar {
+            position: fixed; bottom: 0; left: 0; right: 0; z-index: 100;
+            padding: 16px 20px 36px;
+            background: linear-gradient(transparent, rgba(0,0,0,0.85));
+            display: none; align-items: center; gap: 16px;
+        }
+        #bar.show { display: flex; }
+        .btn {
+            background: rgba(255,255,255,0.2); border: none; color: #fff;
+            border-radius: 50%; width: 52px; height: 52px; font-size: 22px;
+            cursor: pointer; display: flex; align-items: center; justify-content: center;
+            -webkit-tap-highlight-color: transparent; flex-shrink: 0;
+        }
+        #exit-btn {
+            margin-left: auto; border-radius: 10px; width: auto;
+            padding: 12px 18px; font-size: 14px; font-family: -apple-system, sans-serif;
+            background: rgba(220,38,38,0.8);
+        }
+    </style>
+</head>
+<body>
+
+<video id="v" playsinline webkit-playsinline></video>
+
+<div id="tap">
+    <div class="icon">&#9654;</div>
+    <div class="label">Tap to Play</div>
+    <div class="sub" id="tap-sub"></div>
+</div>
+
+<div id="bar">
+    <button class="btn" id="pp">&#9208;</button>
+    <button class="btn" onclick="doFullscreen()">&#x26F6;</button>
+    <button class="btn" id="exit-btn" onclick="doExit()">&#9209; Exit</button>
+</div>
+
+<script>
+function clog(level, msg) {
+    fetch('/api/client-log', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({level, message: '[VP] ' + msg})
+    }).catch(function() {});
+}
+window.onerror = function(m, s, l, c, e) { clog('error', 'JS: ' + m + ' @' + s + ':' + l + ' ' + (e && e.stack || '')); };
+window.addEventListener('unhandledrejection', function(e) {
+    clog('error', 'Promise: ' + (e.reason && (e.reason.stack || e.reason)));
+});
+
+var jobId = location.pathname.split('/').filter(Boolean).pop();
+var p = new URLSearchParams(location.search);
+var sid = p.get('sid');
+var title = p.get('title') || '';
+var anchor = parseFloat(p.get('anchor') || '0');
+
+clog('info', 'INIT jobId=' + jobId + ' sid=' + sid + ' title=' + title + ' anchor=' + anchor);
+
+if (!jobId || !sid) {
+    var errMsg = 'Bad params: jobId=' + jobId + ' sid=' + sid;
+    document.getElementById('tap-sub').textContent = errMsg;
+    clog('error', errMsg);
+}
+
+document.getElementById('tap-sub').textContent = decodeURIComponent(title);
+
+var vid    = document.getElementById('v');
+var tap    = document.getElementById('tap');
+var bar    = document.getElementById('bar');
+var pp     = document.getElementById('pp');
+var tapSub = document.getElementById('tap-sub');
+
+vid.addEventListener('playing', function() {
+    clog('info', 'playing event fired');
+    tap.style.display = 'none';
+    bar.classList.add('show');
+    pp.textContent = '\u23F8';
+});
+vid.addEventListener('pause',  function() { pp.textContent = '\u25B6'; });
+vid.addEventListener('ended',  function() { clog('info', 'ended'); doExit(); });
+vid.addEventListener('waiting', function() { clog('info', 'waiting'); });
+vid.addEventListener('canplay', function() { clog('info', 'canplay'); });
+vid.addEventListener('stalled', function() { clog('warn', 'stalled'); });
+vid.addEventListener('error', function() {
+    var code = vid.error ? vid.error.code : '?';
+    var msg  = vid.error ? vid.error.message : '';
+    clog('error', 'video error code=' + code + ' msg=' + msg);
+    tapSub.textContent = 'Error ' + code + ' - tap to retry';
+    tap.style.display = 'flex';
+});
+
+var streamUrl = '/api/adhoc/stream/' + jobId;
+var started = false;
+
+function startPlayback() {
+    if (started) return;
+    started = true;
+    clog('info', 'startPlayback called, src=' + streamUrl);
+    tap.style.display = 'none';
+
+    vid.src = streamUrl;
+    var pr = vid.play();
+    if (pr !== undefined) {
+        pr.then(function() { clog('info', 'play() resolved'); })
+          .catch(function(err) {
+              clog('error', 'play() rejected: ' + err.name + ' - ' + err.message);
+              tapSub.textContent = err.name + ' - tap to retry';
+              tap.style.display = 'flex';
+              started = false;
+          });
+    }
+}
+
+tap.ontouchstart = function(e) {
+    clog('info', 'TAP ontouchstart touches=' + e.touches.length);
+    startPlayback();
+};
+tap.onclick = function() {
+    clog('info', 'TAP onclick');
+    startPlayback();
+};
+
+var barTimer = null;
+vid.ontouchstart = function() {
+    bar.classList.add('show');
+    clearTimeout(barTimer);
+    barTimer = setTimeout(function() { bar.classList.remove('show'); }, 3500);
+};
+
+pp.onclick = function(e) {
+    e.stopPropagation();
+    if (vid.paused) { vid.play().catch(function(e) { clog('error', 'pp: ' + e); }); }
+    else { vid.pause(); }
+};
+
+function doFullscreen() {
+    if (vid.webkitEnterFullscreen) vid.webkitEnterFullscreen();
+    else if (vid.requestFullscreen) vid.requestFullscreen();
+}
+
+var exiting = false;
+function doExit() {
+    if (exiting) return;
+    exiting = true;
+    vid.pause();
+    var played = vid.currentTime || 0;
+    clog('info', 'exit played=' + played.toFixed(1) + 's');
+    fetch('/api/adhoc/deactivate/' + jobId, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({played_seconds: played})
+    }).catch(function() {}).finally(function() {
+        fetch('/api/adhoc/cleanup', {method: 'POST'}).catch(function() {});
+        window.location.href = '/?sid=' + sid;
+    });
+}
+
+window.addEventListener('pagehide', function() {
+    if (!exiting) {
+        navigator.sendBeacon('/api/adhoc/deactivate/' + jobId,
+            JSON.stringify({played_seconds: vid.currentTime || 0}));
+    }
+});
+</script>
+</body>
+</html>

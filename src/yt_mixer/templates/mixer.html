@@ -219,6 +219,70 @@
         .recovery-banner { display:none; background:#1a2a1a; border:1px solid #2d5a2d; border-left:3px solid #51cf66; border-radius:8px; padding:12px 16px; margin-bottom:16px; font-size:13px; color:#aaa; }
         .recovery-banner.visible { display:flex; align-items:center; gap:10px; }
         .recovery-banner strong { color:#51cf66; }
+
+        /* ── VIDEO OVERLAY ── */
+        #video-overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: #000;
+            z-index: 500;
+            flex-direction: column;
+        }
+        #video-overlay.active { display: flex; }
+        #adhoc-video {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            display: block;
+        }
+        #video-controls-overlay {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            padding: 20px 24px;
+            background: linear-gradient(transparent, rgba(0,0,0,0.85));
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            opacity: 1;
+            transition: opacity 0.3s;
+        }
+        #video-controls-overlay.hidden { opacity: 0; pointer-events: none; }
+        #video-title-bar {
+            position: absolute;
+            top: 0; left: 0; right: 0;
+            padding: 16px 20px;
+            background: linear-gradient(rgba(0,0,0,0.75), transparent);
+            font-size: 14px;
+            color: #ddd;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .vid-btn {
+            background: rgba(255,255,255,0.15);
+            border: none;
+            color: white;
+            border-radius: 50%;
+            width: 52px; height: 52px;
+            font-size: 22px;
+            cursor: pointer;
+            display: flex; align-items: center; justify-content: center;
+            backdrop-filter: blur(4px);
+            flex-shrink: 0;
+        }
+        .vid-btn:active { background: rgba(255,255,255,0.3); }
+        #vid-exit-btn {
+            margin-left: auto;
+            background: rgba(239,68,68,0.7);
+            font-size: 13px;
+            width: auto;
+            border-radius: 8px;
+            padding: 10px 16px;
+            white-space: nowrap;
+        }
     </style>
 </head>
 <body>
@@ -260,7 +324,7 @@
         
         <button class="big-play-btn" onclick="togglePlay()">▶</button>
         
-        <audio id="player" controls></audio>
+        <audio id="player"></audio>
         
         <div class="controls">
             <button onclick="loadChunk()">🔄 Load Chunk</button>
@@ -299,7 +363,7 @@
                            color:#eee; padding:10px 12px; font-size:13px; outline:none;"
                     onkeydown="if(event.key==='Enter') adhocSubmit()"
                 />
-                <button onclick="adhocSubmit()" style="
+                <button id="adhoc-prepare-btn" onclick="adhocSubmit()" style="
                     background:linear-gradient(135deg,#7c3aed,#a855f7);
                     color:white; border:none; border-radius:6px;
                     padding:10px 18px; font-size:13px; cursor:pointer; white-space:nowrap;">
@@ -334,6 +398,17 @@
         </div>
     </div>
 
+    <!-- Video Overlay — shown during adhoc video playback -->
+    <div id="video-overlay">
+        <div id="video-title-bar"></div>
+        <video id="adhoc-video" playsinline webkit-playsinline preload="auto"></video>
+        <div id="video-controls-overlay">
+            <button class="vid-btn" id="vid-playpause-btn" onclick="vidTogglePlay()">⏸</button>
+            <button class="vid-btn" onclick="vidFullscreen()" title="Fullscreen">⛶</button>
+            <button class="vid-btn" id="vid-exit-btn" onclick="adhocExit()">⏹ Exit video</button>
+        </div>
+    </div>
+
     <!-- Log modal -->
     <div id="logModal" style="display:none; position:fixed; z-index:1000; left:0; top:0; width:100%; height:100%; overflow:auto; background-color:rgba(0,0,0,0.7);">
         <div style="background-color:#1e1e1e; color:#d4d4d4; margin:5% auto; padding:20px; border:1px solid #888; width:80%; height:80%; display:flex; flex-direction:column;">
@@ -348,6 +423,18 @@
 
 
     <script>
+        // =========================================================
+        // SERVER-SIDE LOGGING — replaces console.* on mobile
+        // =========================================================
+        function clog(level, message) {
+            // Always post to server; visible in yt-mixer.log without opening DevTools
+            fetch('/api/client-log', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ level, message })
+            }).catch(() => {}); // fire-and-forget; never throws
+        }
+
         // =========================================================
         // REAL-TIME MIXING MONITOR
         // =========================================================
@@ -415,7 +502,7 @@
                     this.updateUI(status);
                     this.updateErrors(status);
                 } catch (error) {
-                    console.error('Progress fetch error:', error);
+                    clog('error', 'Progress fetch error: ' + error);
                 }
             }
 
@@ -573,7 +660,7 @@
                             chunk_index: currentChunkIndex,
                             position: audio.currentTime
                         })
-                    }).catch(e => console.error('Position save failed:', e));
+                    }).catch(e => clog('error', 'Position save failed: ' + e));
                 }
             }, 5000);
         }
@@ -588,10 +675,10 @@
                 if (data.chunk_index !== undefined) {
                     currentChunkIndex = data.chunk_index;
                     savedPosition = data.position_seconds || 0;
-                    console.log(`Restored position: chunk ${currentChunkIndex}, time ${savedPosition}s`);
+                    clog('info', `Restored position: chunk ${currentChunkIndex}, time ${savedPosition}s`);
                 }
             } catch (e) {
-                console.error('Failed to load saved position:', e);
+                clog('error', 'Failed to load saved position: ' + e);
             }
         }
 
@@ -708,8 +795,43 @@
             startPositionSaving();
             updateStatus();
             setInterval(updateStatus, 10000);
+            // Recover any in-progress or ready adhoc job before starting autoplay
+            await adhocRecoverFromServer();
             // Auto-start as soon as a chunk is ready
             autoStartWhenReady();
+        }
+
+        // =========================================================
+        // SERVER-SIDE ADHOC STATE RECOVERY
+        // Called on every page load so refresh never loses job state.
+        // =========================================================
+        async function adhocRecoverFromServer() {
+            if (!sessionID) return;
+            try {
+                const resp = await fetch(`/api/adhoc/active?session_id=${sessionID}`);
+                if (!resp.ok) return; // 404 = no active job, that's fine
+                const data = await resp.json();
+                if (!data.job_id) return;
+
+                // There's a live job on the server — restore it silently
+                adhocState.jobId  = data.job_id;
+                adhocState.title  = data.title || '';
+                adhocState.hasVideo = !!data.has_video;
+                clog('info', `Recovered adhoc job ${data.job_id} status=${data.status}`);
+
+                // Lock input immediately — adhocHandleStatus will unlock if terminal
+                adhocSetInputLocked(true);
+
+                // Drive the UI into the correct state for the recovered status
+                adhocHandleStatus(data);
+
+                // If still in-progress, restart polling
+                if (['preparing_external', 'rendering'].includes(data.status)) {
+                    adhocStartPolling();
+                }
+            } catch(e) {
+                clog('info', 'adhocRecoverFromServer: ' + e); // not an error — just no job
+            }
         }
 
         let autoStartAttempted = false;
@@ -728,7 +850,7 @@
                     if (hasChunk) {
                         clearInterval(poll);
                         autoStartAttempted = true;
-                        console.log('Auto-start: chunk ready, loading...');
+                        clog('info', 'Auto-start: chunk ready, loading...');
                         loadChunk();
                     }
                 } catch (e) { /* keep polling */ }
@@ -751,7 +873,7 @@
                     bigPlayBtn.textContent = '⏸';
                     isPlaying = true;
                 }).catch(err => {
-                    console.error("Error playing audio:", err);
+                    clog("error", "Error playing audio: " + err.message);
                     statusContent.innerHTML = `<span class="error">Error: ${err.message}</span>`;
                 });
             }
@@ -770,10 +892,7 @@
         function loadChunk() {
             statusContent.innerHTML = '<span class="success">Loading audio...</span>';
 
-            // Reset error state before loading new src
-            audio.removeAttribute('src');
-            audio.load();
-
+            // Set src then call load() exactly once — two load() calls = two /stream requests
             audio.src = `/stream?t=${Date.now()}`;
 
             if (isInitialLoad && savedPosition > 0) {
@@ -792,12 +911,15 @@
                     isPlaying = true;
                     updateStatus();
                 }).catch(err => {
-                    console.error("Error playing audio:", err);
+                    clog('error', `Error playing audio: ${err.message}`);
                     statusContent.innerHTML = `<span class="error">Error playing: ${err.message}</span>`;
                 });
             };
             
             audio.onerror = () => {
+                // If we're in adhoc mode the background audio is intentionally stopped —
+                // don't surface its error to the user.
+                if (adhocState.jobId) return;
                 statusContent.innerHTML = '<span class="warning">Waiting for audio (First mix takes 10-30s)...</span>';
             };
         }
@@ -819,7 +941,7 @@
                     }
                 })
                 .catch(err => {
-                    console.error("Error switching chunk:", err);
+                    clog("error", "Error switching chunk: " + err.message);
                     statusContent.innerHTML = `<span class="error">Error: ${err.message}</span>`;
                 });
         }
@@ -859,7 +981,7 @@
                     `;
                 })
                 .catch(err => {
-                    console.error("Error fetching status:", err);
+                    clog("error", "Error fetching status: " + err.message);
                     statusContent.innerHTML = `<span class="error">Status unavailable</span>`;
                 });
         }
@@ -896,9 +1018,28 @@
         }
         
         audio.onended = () => {
-            console.log("Audio ended, advancing to next chunk");
+            clog('info', 'Audio ended, advancing to next chunk');
             nextChunk();
         };
+
+        // ── Video overlay: one-time init for control auto-hide ──────
+        // Attached once here so they never stack no matter how many videos are played.
+        let _vidHideTimer = null;
+        function vidResetHideTimer() {
+            clearTimeout(_vidHideTimer);
+            const ctrl = document.getElementById('video-controls-overlay');
+            if (ctrl) ctrl.classList.remove('hidden');
+            _vidHideTimer = setTimeout(() => {
+                const c = document.getElementById('video-controls-overlay');
+                if (c) c.classList.add('hidden');
+            }, 3000);
+        }
+        (function initVideoOverlayListeners() {
+            const overlay = document.getElementById('video-overlay');
+            if (!overlay) return;
+            overlay.ontouchstart = vidResetHideTimer;
+            overlay.onclick      = vidResetHideTimer;
+        })();
 
         window.addEventListener('chunk-upgraded', (event) => {
             const notification = document.createElement('div');
@@ -932,11 +1073,26 @@
             pollTimer:    null,
             anchorSec:    null,   // absolute_sec at freeze moment
             isPlaying:    false,  // true while adhoc audio is the active source
+            hasVideo:     false,  // true when server produced a final.mp4
+            title:        '',     // video title for display in overlay
         };
 
         function adhocSetStatus(msg, color='#9ca3af') {
             const el = document.getElementById('adhoc-status');
             if (el) { el.textContent = msg; el.style.color = color; }
+        }
+
+        // Lock/unlock the URL input + Prepare button together.
+        // Call with true whenever a job is active, false on any terminal state.
+        function adhocSetInputLocked(locked) {
+            const input = document.getElementById('adhoc-url');
+            const btn   = document.getElementById('adhoc-prepare-btn');
+            if (input) input.disabled = locked;
+            if (btn) {
+                btn.disabled = locked;
+                btn.style.opacity  = locked ? '0.45' : '1';
+                btn.style.cursor   = locked ? 'not-allowed' : 'pointer';
+            }
         }
 
         function adhocShowButtons(...ids) {
@@ -954,6 +1110,10 @@
         }
 
         async function adhocSubmit() {
+            // Belt-and-suspenders: if the button is disabled (job in-flight), do nothing.
+            // This catches any path where the DOM lock is set but the JS event fires anyway.
+            if (document.getElementById('adhoc-prepare-btn')?.disabled) return;
+
             const url = document.getElementById('adhoc-url').value.trim();
             if (!url) return;
             if (!sessionID) { adhocSetStatus('No active session.', '#ef4444'); return; }
@@ -963,7 +1123,7 @@
 
             adhocSetStatus('⏳ Submitting…');
             adhocShowButtons('adhoc-cancel-btn');
-            document.getElementById('adhoc-url').disabled = true;
+            adhocSetInputLocked(true);
 
             try {
                 const resp = await fetch('/api/adhoc/prepare', {
@@ -972,6 +1132,31 @@
                     body: JSON.stringify({ url, session_id: sessionID })
                 });
                 const data = await resp.json();
+
+                if (resp.status === 409) {
+                    // A job is already active for this session (e.g. UI lost track of it
+                    // due to a background stream error). Recover by fetching the active job
+                    // and resuming polling — don't make the user cancel and resubmit.
+                    adhocSetStatus('↩ Reconnecting to active job…', '#fbbf24');
+                    try {
+                        const activeResp = await fetch(`/api/adhoc/active?session_id=${sessionID}`);
+                        if (activeResp.ok) {
+                            const activeData = await activeResp.json();
+                            if (activeData.job_id) {
+                                adhocState.jobId = activeData.job_id;
+                                adhocSetStatus('↩ Reconnected — checking status…', '#a78bfa');
+                                adhocStartPolling();
+                                return;
+                            }
+                        }
+                    } catch(e) { /* fall through to error */ }
+                    // Couldn't recover — tell user to cancel manually
+                    adhocSetStatus('⚠ Another job is active. Cancel it first.', '#f59e0b');
+                    adhocShowButtons('adhoc-cancel-btn');
+                    adhocSetInputLocked(true);
+                    return;
+                }
+
                 if (!resp.ok) throw new Error(data.error || resp.statusText);
 
                 adhocState.jobId = data.job_id;
@@ -980,7 +1165,7 @@
             } catch(e) {
                 adhocSetStatus(`Error: ${e.message}`, '#ef4444');
                 adhocShowButtons();
-                document.getElementById('adhoc-url').disabled = false;
+                adhocSetInputLocked(false);
             }
         }
 
@@ -1004,20 +1189,24 @@
                 const data = await resp.json();
                 adhocHandleStatus(data);
             } catch(e) {
-                console.error('adhoc poll error', e);
+                clog('error', 'adhoc poll error: ' + e);
             }
         }
 
         async function adhocHandleStatus(data) {
-            const { status, title, duration, error } = data;
+            const { status, title, duration, error, has_video } = data;
             const mins = duration
                 ? `${Math.floor(duration/60)}m${Math.floor(duration%60)}s`
                 : '';
+
+            // Capture title whenever available
+            if (title) adhocState.title = title;
 
             switch(status) {
                 case 'preparing_external':
                     adhocSetStatus(`⏳ Downloading: ${title || '…'} ${mins}`, '#a78bfa');
                     adhocShowButtons('adhoc-cancel-btn');
+                    adhocSetInputLocked(true);
                     break;
 
                 case 'finalizing':
@@ -1030,18 +1219,28 @@
 
                 case 'rendering':
                     adhocSetStatus('🔀 Mixing streams…', '#fbbf24');
+                    adhocShowButtons('adhoc-cancel-btn');
+                    adhocSetInputLocked(true);
+                    // Ensure polling is running (may have been stopped before Phase B)
+                    if (!adhocState.pollTimer) adhocStartPolling();
                     break;
 
                 case 'ready':
                     adhocStopPolling();
+                    adhocState.hasVideo = !!has_video;
+                    const videoLabel = adhocState.hasVideo ? '🎬' : '🎵';
                     adhocSetStatus(`✅ Mix ready: ${title || ''} ${mins}`, '#10b981');
                     adhocShowButtons('adhoc-play-btn', 'adhoc-cancel-btn');
+                    adhocSetInputLocked(false);
+                    document.getElementById('adhoc-play-btn').textContent =
+                        adhocState.hasVideo ? `${videoLabel} Play video` : `▶ Play with video audio`;
                     break;
 
                 case 'failed':
                     adhocStopPolling();
                     adhocSetStatus(`❌ Prep failed: ${error || 'unknown error'}`, '#ef4444');
                     adhocShowButtons();
+                    adhocSetInputLocked(false);
                     adhocReset();
                     break;
 
@@ -1049,28 +1248,26 @@
                     adhocStopPolling();
                     adhocSetStatus(`❌ Mix failed: ${error || 'unknown error'}`, '#ef4444');
                     adhocShowButtons();
-                    // Resume background from the moment we froze audio
-                    if (adhocState.anchorSec !== null) {
-                        adhocResumeBackground(adhocState.anchorSec);
-                    }
+                    adhocSetInputLocked(false);
                     adhocReset();
                     break;
 
                 case 'cancelled':
                 case 'done':
                     adhocStopPolling();
+                    adhocSetInputLocked(false);
                     adhocReset();
                     break;
             }
         }
 
         async function adhocTriggerPhaseB() {
-            // One and only pause — snapshot exact position
-            audio.pause();
+            // Snapshot current position but DO NOT pause audio — video has its own
+            // music track so there's no need to freeze background playback during render.
             const absoluteSec = adhocGetAbsoluteSec();
             adhocState.anchorSec = absoluteSec;
 
-            adhocSetStatus('🔀 Rendering mix (background sliced, audio paused)…', '#fbbf24');
+            adhocSetStatus('🔀 Rendering mix in background…', '#fbbf24');
 
             try {
                 const resp = await fetch(`/api/adhoc/finalize/${adhocState.jobId}`, {
@@ -1080,41 +1277,153 @@
                 });
                 const data = await resp.json();
                 if (!resp.ok) throw new Error(data.error || resp.statusText);
-                adhocHandleStatus({ status: data.status, title: data.title, duration: data.duration });
+                // Server returns {status:"rendering"} immediately — resume polling
+                adhocHandleStatus({ status: data.status, title: adhocState.title });
+                adhocStartPolling();
             } catch(e) {
                 adhocSetStatus(`❌ Mix failed: ${e.message}`, '#ef4444');
-                adhocResumeBackground(adhocState.anchorSec);
                 adhocReset();
             }
         }
 
         function adhocPlay() {
             if (!adhocState.jobId) return;
-            adhocState.isPlaying = true;
 
-            // Swap the audio element's source to the pre-mixed file
+            if (adhocState.hasVideo) {
+                // Navigate to a completely separate page with ONLY a <video> element.
+                // iOS refuses video when any <audio> element exists on the same page,
+                // even paused/empty. Full page redirect is the only clean solution.
+                const titleParam  = encodeURIComponent(adhocState.title || '');
+                const anchorParam = adhocState.anchorSec || 0;
+                window.location.href =
+                    `/video/${adhocState.jobId}?sid=${sessionID}&title=${titleParam}&anchor=${anchorParam}`;
+            } else {
+                adhocState.isPlaying = true;
+                _adhocPlayAudio(`/api/adhoc/stream/${adhocState.jobId}?t=${Date.now()}`);
+            }
+        }
+
+        function _adhocPlayAudio(streamUrl) {
+            // Audio-only fallback path (unchanged from before)
             audio.pause();
-            audio.src = `/api/adhoc/stream/${adhocState.jobId}?t=${Date.now()}`;
+            audio.src = streamUrl;
             audio.load();
             audio.oncanplaythrough = () => {
-                audio.play().catch(e => console.error('adhoc play error', e));
+                audio.play().catch(e => clog('error', 'adhoc play error: ' + e));
                 adhocSetStatus('▶ Playing video audio…', '#10b981');
                 adhocShowButtons('adhoc-exit-btn');
                 audio.oncanplaythrough = null;
             };
-            // Auto-exit when the mix finishes naturally
+            // When the adhoc mix ends naturally, exit and restore normal chunk handler
             audio.onended = () => {
-                if (adhocState.isPlaying) adhocExit();
-                else nextChunk();
+                if (adhocState.isPlaying) {
+                    audio.onended = () => nextChunk(); // restore before exit flow
+                    adhocExit();
+                } else {
+                    audio.onended = () => nextChunk();
+                    nextChunk();
+                }
             };
+        }
+
+        function _adhocPlayVideo(streamUrl) {
+            // iOS will refuse to play video if ANY <audio> element has an active src,
+            // even if paused. Fully evict the audio element from the audio session:
+            // remove its src, call load() (which resets internal media state), then
+            // hide the entire player section so iOS has zero competing media.
+            audio.pause();
+            audio.removeAttribute('src');
+            audio.load();
+            document.getElementById('player-section').style.visibility = 'hidden';
+
+            const vid = document.getElementById('adhoc-video');
+            const overlay = document.getElementById('video-overlay');
+            const titleBar = document.getElementById('video-title-bar');
+
+            // Clear any previous error/handler state on the video element
+            vid.onerror   = null;
+            vid.onended   = null;
+            vid.oncanplay = null;
+            vid.removeAttribute('src');
+            vid.load();
+
+            titleBar.textContent = adhocState.title || '';
+            overlay.classList.add('active');
+            vidResetHideTimer();
+
+            // Assign handlers before setting src so nothing fires into a void
+            vid.onended = () => {
+                if (adhocState.isPlaying) adhocExit();
+            };
+            vid.onerror = () => {
+                clog('error', `Video element error code=${vid.error?.code} message=${vid.error?.message}`);
+                overlay.classList.remove('active');
+                document.getElementById('player-section').style.visibility = '';
+                // Don't fall back to audio — if video errors on iOS it means the audio
+                // session is still contested. Just restore background instead.
+                adhocState.isPlaying = false;
+                adhocResumeBackground(adhocState.anchorSec || 0);
+                adhocReset();
+            };
+
+            // Set src and play immediately while still inside the user-gesture call stack
+            vid.src = streamUrl;
+            vid.load();
+            vid.play().then(() => {
+                adhocSetStatus('▶ Playing…', '#10b981');
+                adhocShowButtons('adhoc-exit-btn');
+                document.getElementById('vid-playpause-btn').textContent = '⏸';
+            }).catch(err => {
+                clog('error', `Video play() failed: ${err.name} — ${err.message}`);
+                overlay.classList.remove('active');
+                document.getElementById('player-section').style.visibility = '';
+                adhocState.isPlaying = false;
+                adhocResumeBackground(adhocState.anchorSec || 0);
+                adhocReset();
+            });
+        }
+
+        function vidTogglePlay() {
+            const vid = document.getElementById('adhoc-video');
+            const btn = document.getElementById('vid-playpause-btn');
+            if (vid.paused) {
+                vid.play();
+                btn.textContent = '⏸';
+            } else {
+                vid.pause();
+                btn.textContent = '▶';
+            }
+        }
+
+        function vidFullscreen() {
+            const vid = document.getElementById('adhoc-video');
+            if (vid.requestFullscreen) vid.requestFullscreen();
+            else if (vid.webkitEnterFullscreen) vid.webkitEnterFullscreen(); // iOS Safari
+            else if (vid.webkitRequestFullscreen) vid.webkitRequestFullscreen();
         }
 
         async function adhocExit() {
             adhocStopPolling();
-            const playedSec = adhocState.isPlaying ? (audio.currentTime || 0) : 0;
+
+            const vid = document.getElementById('adhoc-video');
+            const overlay = document.getElementById('video-overlay');
+
+            // Grab played time from whichever element is active
+            const playedSec = adhocState.isPlaying
+                ? (adhocState.hasVideo ? (vid.currentTime || 0) : (audio.currentTime || 0))
+                : 0;
+
             adhocState.isPlaying = false;
 
-            audio.pause();
+            // Fully tear down video element — remove src so iOS releases the audio session
+            vid.pause();
+            vid.removeAttribute('src');
+            vid.load();
+            overlay.classList.remove('active');
+
+            // Restore player section visibility before resuming audio
+            document.getElementById('player-section').style.visibility = '';
+
             adhocSetStatus('⏹ Stopping, resuming background…', '#9ca3af');
             adhocShowButtons();
 
@@ -1132,10 +1441,13 @@
                             : (adhocState.anchorSec || 0)
                     );
                 } catch(e) {
-                    console.error('deactivate error', e);
+                    clog('error', 'deactivate error: ' + e);
                     adhocResumeBackground(adhocState.anchorSec || 0);
                 }
             }
+
+            // Fire-and-forget cleanup of stale jobs
+            fetch('/api/adhoc/cleanup', { method: 'POST' }).catch(() => {});
 
             adhocReset();
         }
@@ -1148,6 +1460,15 @@
                     await fetch(`/api/adhoc/cancel/${jobId}`, { method: 'POST' });
                 } catch(e) {}
             }
+            // Always fully tear down video element and restore player section
+            const vid = document.getElementById('adhoc-video');
+            const overlay = document.getElementById('video-overlay');
+            vid.pause();
+            vid.removeAttribute('src');
+            vid.load();
+            overlay.classList.remove('active');
+            document.getElementById('player-section').style.visibility = '';
+
             if (!silent) {
                 adhocSetStatus('Cancelled.', '#6b7280');
                 adhocShowButtons();
@@ -1156,7 +1477,8 @@
         }
 
         function adhocResumeBackground(absoluteSec) {
-            // Restore the normal chunk-end handler
+            // Restore the normal chunk-end handler first — must happen before any
+            // async work so audio.onended is never in an ambiguous state.
             audio.onended = () => nextChunk();
 
             // Convert absolute seconds back to chunk index + seek offset
@@ -1164,34 +1486,62 @@
             currentChunkIndex = Math.floor(absoluteSec / CHUNK_DUR);
             const offset = absoluteSec % CHUNK_DUR;
 
-            audio.removeAttribute('src');
-            audio.load();
-            audio.src = `/stream?t=${Date.now()}`;
-            audio.load();
+            adhocSetStatus('↩ Resuming background…', '#9ca3af');
 
-            audio.addEventListener('loadedmetadata', function seekBack() {
-                if (offset > 0 && audio.duration > offset) {
-                    audio.currentTime = offset;
-                }
-                audio.removeEventListener('loadedmetadata', seekBack);
-            });
+            // /stream can return 503 if the AudioWorker chunk isn't ready yet
+            // (common when Phase B took a long time and the worker was busy).
+            // Retry every 5s until we get a good response.
+            let resumeAttempt = 0;
+            function tryResume() {
+                resumeAttempt++;
+                audio.removeAttribute('src');
+                audio.load();
+                audio.src = `/stream?t=${Date.now()}`;
+                audio.load();
 
-            audio.oncanplaythrough = () => {
-                audio.play().then(() => {
-                    adhocSetStatus('', '#9ca3af');
-                    document.getElementById('adhoc-url').value = '';
-                    document.getElementById('adhoc-url').disabled = false;
-                }).catch(e => console.error('resume play error', e));
-                audio.oncanplaythrough = null;
-            };
+                // Seek to saved position on first successful metadata load
+                audio.addEventListener('loadedmetadata', function seekBack() {
+                    if (offset > 0 && audio.duration > offset) {
+                        audio.currentTime = offset;
+                    }
+                    audio.removeEventListener('loadedmetadata', seekBack);
+                });
+
+                audio.oncanplaythrough = () => {
+                    audio.play().then(() => {
+                        adhocSetStatus('', '#9ca3af');
+                        document.getElementById('adhoc-url').value = '';
+                        adhocSetInputLocked(false);
+                    }).catch(e => clog('error', 'resume play error: ' + e));
+                    audio.oncanplaythrough = null;
+                };
+
+                // If the stream isn't ready yet, wait and retry
+                audio.onerror = () => {
+                    // If we've left adhoc mode by now, hand off to normal handler
+                    if (!adhocState.jobId && resumeAttempt > 1) {
+                        audio.onerror = () => {
+                            statusContent.innerHTML = '<span class="warning">Waiting for audio...</span>';
+                        };
+                        return;
+                    }
+                    clog('info', `Resume attempt ${resumeAttempt}: stream not ready, retrying in 5s...`);
+                    adhocSetStatus(`↩ Waiting for background (attempt ${resumeAttempt})…`, '#9ca3af');
+                    setTimeout(tryResume, 5000);
+                };
+            }
+
+            tryResume();
         }
 
         function adhocReset() {
             adhocState.jobId     = null;
             adhocState.anchorSec = null;
             adhocState.isPlaying = false;
+            adhocState.hasVideo  = false;
+            adhocState.title     = '';
             adhocShowButtons();
-            document.getElementById('adhoc-url').disabled = false;
+            adhocSetInputLocked(false);
         }
 
     </script>

@@ -380,6 +380,48 @@ def video_stream_url():
 from . import video_engine as _ve
 from .video_engine import ConflictError, NotFoundError, StateError
  
+@app.route('/video/<job_id>')
+def video_player(job_id):
+    """
+    Standalone video-only page. Zero <audio> elements — iOS has no competing
+    audio session to fight over. Accepts query params: sid, title, anchor.
+    On exit the page POSTs deactivate and redirects back to /?sid=<sid>.
+    """
+    try:
+        status = _ve.get_job_status(job_id)
+    except NotFoundError:
+        return "Job not found", 404
+    if status.get('status') != 'ready':
+        return "Job not ready", 409
+    return render_template(
+        'video_player.html',
+        job_id=job_id,
+    )
+
+
+@app.route('/api/adhoc/active')
+def adhoc_active():
+    """
+    Return the currently active job for a session, if any.
+    Used by the client to recover after UI/server desync (e.g. a 409 on /prepare).
+    Query param: session_id
+    Returns: { job_id, status, title, duration, has_video } or 404.
+    """
+    session_id = request.args.get('session_id', '').strip()
+    if not session_id:
+        return jsonify(error="Missing session_id"), 400
+    job = _ve.get_active_job_for_session(session_id)
+    if not job:
+        return jsonify(error="No active job for session"), 404
+    return jsonify({
+        "job_id":    job["job_id"],
+        "status":    job["status"],
+        "title":     job.get("title"),
+        "duration":  job.get("duration"),
+        "has_video": bool(job.get("has_video", False)),
+    })
+
+
 @app.route('/api/adhoc/prepare', methods=['POST'])
 def adhoc_prepare():
     """
@@ -417,12 +459,12 @@ def adhoc_prepare():
 def adhoc_status(job_id):
     """
     Poll this every 3 seconds.
-    Returns: { job_id, status, title, duration, error? }
+    Returns: { job_id, status, title, duration, has_video, error? }
     Statuses:
       preparing_external  → Phase A running (audio keeps playing)
       finalizing          → Phase A done; client should pause + POST to /finalize
       rendering           → Phase B running
-      ready               → final_mix.mp3 ready; show Play button
+      ready               → final.mp4 (or final_mix.mp3) ready; show Play button
       failed              → Phase A failed; audio never interrupted
       finalize_failed     → Phase B failed; client should resume from anchor
       cancelled           → user cancelled
@@ -430,11 +472,12 @@ def adhoc_status(job_id):
     try:
         status = _ve.get_job_status(job_id)
         return jsonify({
-            "job_id":   status["job_id"],
-            "status":   status["status"],
-            "title":    status.get("title"),
-            "duration": status.get("duration"),
-            "error":    status.get("error"),
+            "job_id":    status["job_id"],
+            "status":    status["status"],
+            "title":     status.get("title"),
+            "duration":  status.get("duration"),
+            "has_video": bool(status.get("has_video", False)),
+            "error":     status.get("error"),
         })
     except NotFoundError as e:
         return jsonify(error=str(e)), 404
@@ -447,51 +490,122 @@ def adhoc_finalize(job_id):
     """
     Phase B — client sends its current absolute timeline position.
     Server slices the background, mixes it with YT audio, produces final_mix.mp3.
- 
+
     Body: { "absolute_sec": <float> }
- 
-    On success: { status: "ready", job_id, anchor_absolute_sec }
-    On failure: { status: "finalize_failed", error }
+
+    Returns immediately with { status: "rendering", job_id } — Phase B runs in a
+    background thread so the Flask /stream thread is never blocked and audio keeps
+    playing uninterrupted.  Client polls /api/adhoc/status/<job_id> until ready/failed.
     """
+    import threading as _threading
+
     data = request.get_json() or {}
- 
+
     try:
         absolute_sec = float(data['absolute_sec'])
     except (KeyError, TypeError, ValueError):
         return jsonify(error="Missing or invalid absolute_sec"), 400
- 
+
     try:
         status = _ve.get_job_status(job_id)
     except NotFoundError as e:
         return jsonify(error=str(e)), 404
- 
+
     session_id = status.get("session_id")
     chunk_dir  = manager.get_chunk_dir_for_session(session_id)
- 
+
     try:
-        result = _ve.finalize_job(job_id, absolute_sec, chunk_dir)
-        return jsonify(result)
+        # Transition to 'rendering' immediately so the client can resume polling
+        # and audio is never paused waiting for ffmpeg.
+        _ve.mark_rendering(job_id)
     except StateError as e:
         return jsonify(error=str(e)), 409
     except Exception as e:
-        log.error(f"adhoc_finalize error: {e}")
+        log.error(f"adhoc_finalize mark_rendering error: {e}")
         return jsonify(error=str(e), status="finalize_failed"), 500
+
+    def _run_phase_b():
+        try:
+            _ve.finalize_job(job_id, absolute_sec, chunk_dir)
+        except Exception as exc:
+            log.error(f"adhoc_finalize error: {exc}")
+
+    t = _threading.Thread(target=_run_phase_b, daemon=True,
+                          name=f"phase-b-{job_id}")
+    t.start()
+
+    return jsonify({"status": "rendering", "job_id": job_id}), 202
  
  
 @app.route('/api/adhoc/stream/<job_id>')
 def adhoc_stream(job_id):
     """
-    Serve the final mixed .mp3 for the <audio> element.
-    The client sets audio.src = this URL after seeing status = "ready".
+    Serve the final mixed media for playback.
+    Returns final.mp4 (video/mp4) or final_mix.mp3 (audio/mpeg).
+
+    iOS Safari REQUIRES proper HTTP 206 range responses for video — it sends a
+    Range: bytes=0- probe before playing and rejects anything that returns 200.
+    We handle this manually so mp4 seeks and plays correctly on mobile.
     """
     try:
-        path = _ve.stream_path(job_id)
-        return send_file(path, mimetype='audio/mpeg')
+        path, mimetype = _ve.stream_path(job_id)
     except (NotFoundError, StateError) as e:
         return jsonify(error=str(e)), 404
     except Exception as e:
         log.error(f"adhoc_stream error: {e}")
         return jsonify(error=str(e)), 500
+
+    # For audio-only, Flask's send_file is fine (audio elements tolerate 200).
+    if mimetype != 'video/mp4':
+        return send_file(path, mimetype=mimetype)
+
+    # ── Range-aware response for mp4 (required by iOS Safari / WebKit) ────────
+    import os
+    file_size = os.path.getsize(path)
+    range_header = request.headers.get('Range')
+
+    if not range_header:
+        # No Range header — return full file but still advertise range support
+        def _full():
+            with open(path, 'rb') as f:
+                while True:
+                    chunk = f.read(1 << 16)
+                    if not chunk:
+                        break
+                    yield chunk
+        resp = Response(_full(), status=200, mimetype=mimetype)
+        resp.headers['Content-Length'] = file_size
+        resp.headers['Accept-Ranges'] = 'bytes'
+        return resp
+
+    # Parse "bytes=start-end"
+    try:
+        byte_range = range_header.replace('bytes=', '').strip()
+        start_s, end_s = byte_range.split('-')
+        start = int(start_s)
+        end   = int(end_s) if end_s else file_size - 1
+    except Exception:
+        return jsonify(error="Invalid Range header"), 416
+
+    end = min(end, file_size - 1)
+    length = end - start + 1
+
+    def _partial():
+        with open(path, 'rb') as f:
+            f.seek(start)
+            remaining = length
+            while remaining > 0:
+                chunk = f.read(min(1 << 16, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+
+    resp = Response(_partial(), status=206, mimetype=mimetype)
+    resp.headers['Content-Range']  = f'bytes {start}-{end}/{file_size}'
+    resp.headers['Content-Length'] = length
+    resp.headers['Accept-Ranges']  = 'bytes'
+    return resp
  
  
 @app.route('/api/adhoc/deactivate/<job_id>', methods=['POST'])
@@ -532,6 +646,21 @@ def adhoc_cancel(job_id):
         _ve.cancel_job(job_id)
         return jsonify(ok=True)
     except Exception as e:
+        return jsonify(error=str(e)), 500
+
+
+@app.route('/api/adhoc/cleanup', methods=['POST'])
+def adhoc_cleanup():
+    """
+    Trigger GC of stale adhoc job directories.
+    Called opportunistically: on page load, on exit from video mode.
+    Deletes jobs that are done/failed/cancelled and older than their TTL.
+    """
+    try:
+        _ve.cleanup_old_jobs()
+        return jsonify(ok=True)
+    except Exception as e:
+        log.warning(f"adhoc_cleanup error: {e}")
         return jsonify(error=str(e)), 500
  
 # ============================================================================
@@ -674,6 +803,21 @@ def start_server(host=None, port=None, debug=False):
     
     # Ensure manager's cleanup thread is running
     manager.start_maintenance()
+
+    # Wire video_engine GC into a background thread so stale jobs are always
+    # cleaned up on a server-driven schedule, not just when the client calls /cleanup.
+    import threading as _threading
+    def _ve_gc_loop():
+        import time as _time
+        while True:
+            _time.sleep(30 * 60)   # every 30 minutes
+            try:
+                _ve.cleanup_old_jobs()
+            except Exception as _e:
+                log.warning(f"video_engine GC error: {_e}")
+    _t = _threading.Thread(target=_ve_gc_loop, daemon=True, name="ve-gc")
+    _t.start()
+    log.info("video_engine GC thread started (30 min interval)")
     
     try:
         app.run(host=host, port=actual_port, debug=debug, use_reloader=False, threaded=True)

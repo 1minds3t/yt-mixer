@@ -41,6 +41,70 @@ _JOBS_DIR:  Path | None = None
 _CHUNK_DIR: Path | None = None
 _AUDIO_DIR: Path | None = None   # raw per-session music files live here
 
+# ---------------------------------------------------------------------------
+# omnipkg daemon — optional, graceful fallback if not available
+# ---------------------------------------------------------------------------
+# Single DaemonClient instance shared across all calls.
+# Workers are pinned (pin=True) so they survive idle timeout indefinitely.
+# Two tagged workers:
+#   ytdlp-info   — metadata probes (fast, many small calls)
+#   ytdlp-dl     — actual downloads (long-running, needs its own process)
+#
+# yt-dlp version: update this when you upgrade yt-dlp in the env.
+_YTDLP_SPEC = "yt-dlp==2026.3.17"   # no version pin — uses whatever is active in env
+_daemon_client = None
+_daemon_lock   = threading.Lock()
+
+def _get_daemon():
+    """Return the shared DaemonClient, or None if omnipkg is not available."""
+    global _daemon_client
+    if _daemon_client is not None:
+        return _daemon_client
+    with _daemon_lock:
+        if _daemon_client is not None:   # double-check after lock
+            return _daemon_client
+        try:
+            from omnipkg.isolation.worker_daemon import DaemonClient
+            client = DaemonClient()
+            status = client.status()
+            if status.get("success"):
+                _daemon_client = client
+                log.info("video_engine: omnipkg daemon connected — yt-dlp workers will be pinned")
+            else:
+                log.info("video_engine: omnipkg daemon not running — using direct yt-dlp imports")
+        except Exception as e:
+            log.debug(f"video_engine: omnipkg not available ({e}) — using direct yt-dlp imports")
+    return _daemon_client
+
+
+def _start_daemon_keepalive():
+    """
+    Ping pinned workers every 4 minutes so they survive the default 5-min
+    idle timeout even during long quiet periods (e.g. overnight).
+    Only runs if daemon is available.
+    """
+    def _ping():
+        # Wait a bit after startup before first ping
+        time.sleep(30)
+        while True:
+            time.sleep(240)   # every 4 min — well under 5-min default TTL
+            client = _get_daemon()
+            if client:
+                for tag in ("ytdlp-info", "ytdlp-dl"):
+                    try:
+                        client.execute_smart(
+                            _YTDLP_SPEC,
+                            "pass",
+                            worker_tag=tag,
+                            pin=True,
+                        )
+                    except Exception:
+                        pass   # daemon might be restarting — silent, retry next cycle
+
+    t = threading.Thread(target=_ping, daemon=True, name="ytdlp-keepalive")
+    t.start()
+
+
 def init(data_dir: Path, chunk_dir: Path, audio_dir: Path | None = None):
     """Call once at app startup to wire up paths."""
     global _JOBS_DIR, _CHUNK_DIR, _AUDIO_DIR
@@ -51,6 +115,8 @@ def init(data_dir: Path, chunk_dir: Path, audio_dir: Path | None = None):
     log.info(f"video_engine: jobs dir = {_JOBS_DIR}")
     # Kick off cleanup of any stale jobs from a previous run
     _cleanup_stale()
+    # Start daemon keepalive thread (no-op if daemon not available)
+    _start_daemon_keepalive()
 
 
 # ---------------------------------------------------------------------------
@@ -136,20 +202,43 @@ def get_job_status(job_id: str) -> dict:
     return _public_status(job)
 
 
-def finalize_job(job_id: str, absolute_sec: float, chunk_dir_for_session: Path) -> dict:
+def mark_rendering(job_id: str):
     """
-    Phase B — called by the route when client reports its freeze position.
-    Runs synchronously (should be < 60s for up to 90-min video).
-    Returns updated status dict.
+    Atomically transition a job from 'finalizing' -> 'rendering'.
+    Called by the route handler immediately before spawning the Phase B thread,
+    so the route can return 202 without waiting for ffmpeg to finish.
+    Raises StateError if the job is not in 'finalizing' state.
     """
     with _jobs_lock:
         job = _jobs.get(job_id)
     if not job:
         raise NotFoundError(f"Job {job_id} not found")
     if job["status"] != "finalizing":
-        raise StateError(f"Job {job_id} is in state '{job['status']}', expected 'finalizing'")
+        raise StateError(
+            f"Job {job_id} is in state '{job['status']}', expected 'finalizing'"
+        )
+    job["status"] = "rendering"
+    _write_status(job)
+    log.info(f"[{job_id}] Marked rendering (async Phase B will follow)")
 
-    job["status"]             = "rendering"
+
+def finalize_job(job_id: str, absolute_sec: float, chunk_dir_for_session: Path) -> dict:
+    """
+    Phase B — runs in a background thread (spawned by the route after mark_rendering).
+    Accepts status 'rendering' (set by mark_rendering) as well as the legacy
+    'finalizing' path so the function stays usable if called directly in tests.
+    """
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job:
+        raise NotFoundError(f"Job {job_id} not found")
+    if job["status"] not in ("finalizing", "rendering"):
+        raise StateError(
+            f"Job {job_id} is in state '{job['status']}', expected 'finalizing' or 'rendering'"
+        )
+
+    # Ensure rendering state + anchor are persisted (idempotent if mark_rendering ran first)
+    job["status"]              = "rendering"
     job["anchor_absolute_sec"] = absolute_sec
     _write_status(job)
 
@@ -167,16 +256,26 @@ def finalize_job(job_id: str, absolute_sec: float, chunk_dir_for_session: Path) 
         raise
 
 
-def stream_path(job_id: str) -> Path:
-    """Return path to final mixed .mp3 for serving."""
+def stream_path(job_id: str) -> tuple[Path, str]:
+    """Return (path, mimetype) for the final media file."""
     with _jobs_lock:
         job = _jobs.get(job_id)
     if not job or job["status"] != "ready":
         raise StateError(f"Job {job_id} not ready for streaming")
-    p = Path(job["job_dir"]) / "final_mix.mp3"
-    if not p.exists():
-        raise NotFoundError(f"final_mix.mp3 missing for job {job_id}")
-    return p
+
+    job_dir = Path(job["job_dir"])
+
+    # Prefer the muxed MP4 (video + mixed audio)
+    mp4 = job_dir / "final.mp4"
+    if mp4.exists() and mp4.stat().st_size > 0:
+        return mp4, "video/mp4"
+
+    # Fall back to audio-only if mux failed or video wasn't available
+    mp3 = job_dir / "final_mix.mp3"
+    if mp3.exists():
+        return mp3, "audio/mpeg"
+
+    raise NotFoundError(f"No streamable file found for job {job_id}")
 
 
 def deactivate_job(job_id: str, played_seconds: float) -> dict:
@@ -258,9 +357,6 @@ def _run_phase_a(job_id: str):
         _write_status(job)
 
         # ── 2a. Start fresh music-bg build in parallel ─────────────
-        # While yt-dlp downloads, we pull from the session music queue
-        # and build a clean music-only mp3 sized to this video's duration.
-        # This runs concurrently so it costs zero extra wall-clock time.
         music_bg_path = job_dir / "music_bg.mp3"
         music_bg_ready = threading.Event()
         music_bg_error = []
@@ -275,14 +371,32 @@ def _run_phase_a(job_id: str):
             except Exception as e:
                 log.warning(f"[{job_id}] Music-bg build failed: {e} — will fall back to chunk slice")
                 music_bg_error.append(str(e))
-                music_bg_ready.set()   # unblock Phase B either way
+                music_bg_ready.set()
 
         music_bg_thread = threading.Thread(target=_build_music_bg, daemon=True)
         music_bg_thread.start()
 
-        # ── 2b. Download YT audio-only ─────────────────────────────
-        log.info(f"[{job_id}] Phase A: downloading audio ({duration:.0f}s)...")
+        # ── 2b. Download YT audio-only AND video-only in parallel ─────
+        log.info(f"[{job_id}] Phase A: downloading audio + video ({duration:.0f}s)...")
         yt_audio_path = job_dir / "yt_audio.m4a"
+        yt_video_path = job_dir / "yt_video.mp4"
+
+        video_dl_error = []
+        video_dl_done  = threading.Event()
+
+        def _download_video():
+            try:
+                _yt_dlp_download_video(job_id, url, yt_video_path, job)
+                video_dl_done.set()
+            except Exception as e:
+                log.warning(f"[{job_id}] Video download failed: {e} — will serve audio-only")
+                video_dl_error.append(str(e))
+                video_dl_done.set()
+
+        video_dl_thread = threading.Thread(target=_download_video, daemon=True)
+        video_dl_thread.start()
+
+        # Audio download runs in main Phase A thread
         _yt_dlp_download(job_id, url, yt_audio_path, job)
 
         if job["status"] == "cancelled":
@@ -293,7 +407,8 @@ def _run_phase_a(job_id: str):
         yt_mp3_path = job_dir / "yt_audio.mp3"
         _ffmpeg(
             job_id,
-            ["-i", str(yt_audio_path),
+            ["-threads", "2",
+             "-i", str(yt_audio_path),
              "-ar", "44100", "-ac", "2", "-b:a", "192k",
              "-y", str(yt_mp3_path)],
             job
@@ -306,9 +421,9 @@ def _run_phase_a(job_id: str):
         real_dur = _probe_duration(yt_mp3_path)
         job["duration"] = real_dur
 
-        # ── 5. Wait for music-bg (usually already done by now) ──────
+        # ── 5. Wait for music-bg and video download ──────────────────
         log.info(f"[{job_id}] Phase A: waiting for music-bg concat...")
-        music_bg_ready.wait(timeout=300)   # generous; yt download usually takes longer
+        music_bg_ready.wait(timeout=300)
         job["music_bg_ok"] = (
             music_bg_path.exists()
             and music_bg_path.stat().st_size > 0
@@ -319,8 +434,20 @@ def _run_phase_a(job_id: str):
         else:
             log.warning(f"[{job_id}] Music-bg not ready — Phase B will fall back to chunk slice")
 
+        log.info(f"[{job_id}] Phase A: waiting for video download...")
+        video_dl_done.wait(timeout=600)
+        job["video_ok"] = (
+            yt_video_path.exists()
+            and yt_video_path.stat().st_size > 0
+            and not video_dl_error
+        )
+        if job["video_ok"]:
+            log.info(f"[{job_id}] Video ready ({yt_video_path.stat().st_size/1e6:.1f} MB)")
+        else:
+            log.warning(f"[{job_id}] Video not ready — Phase B will produce audio-only")
+
         log.info(f"[{job_id}] Phase A complete. Duration: {real_dur:.1f}s, title: {job['title']}")
-        job["status"] = "finalizing"   # Signal client to trigger Phase B
+        job["status"] = "finalizing"
         _write_status(job)
 
     except Exception as e:
@@ -337,15 +464,11 @@ def _collect_music_for_video(job_id: str, session_id: str,
     Pull music tracks from AUDIO_DIR/session_id (already downloaded by AudioWorker),
     concat enough to cover target_duration seconds, looping the available pool if
     needed. Applies a quick dynaudnorm pass so levels are consistent.
-
-    Files are named music_{video_id}.mp3 by AudioWorker._download_audio().
-    We read whatever is on disk right now — no new downloads.
     """
     audio_dir = (_AUDIO_DIR / session_id) if _AUDIO_DIR else None
     if not audio_dir or not audio_dir.exists():
         raise FileNotFoundError(f"Audio dir not found: {audio_dir}")
 
-    # Gather all music files for this session, sorted for determinism
     music_files = sorted(audio_dir.glob("music_*.mp3"))
     if not music_files:
         raise FileNotFoundError(f"No music files found in {audio_dir}")
@@ -353,16 +476,15 @@ def _collect_music_for_video(job_id: str, session_id: str,
     log.info(f"[{job_id}] Music-bg: {len(music_files)} source files available, "
              f"need {target_duration:.0f}s")
 
-    # Build a looped playlist that covers target_duration
     playlist: list[Path] = []
     total = 0.0
     pool = list(music_files)
     import random as _random
-    _random.shuffle(pool)   # randomise order each time
+    _random.shuffle(pool)
 
     while total < target_duration:
         if not pool:
-            pool = list(music_files)   # loop the pool
+            pool = list(music_files)
             _random.shuffle(pool)
         f = pool.pop(0)
         dur = _probe_duration(f)
@@ -373,15 +495,13 @@ def _collect_music_for_video(job_id: str, session_id: str,
 
     log.info(f"[{job_id}] Music-bg playlist: {len(playlist)} tracks = {total:.0f}s")
 
-    # Write concat list
     concat_txt = out_path.parent / "music_bg_list.txt"
     with open(concat_txt, "w") as fh:
         for p in playlist:
             fh.write(f"file '{p}'\n")
 
-    # Concat + trim to exact duration + quick loudnorm
     result = subprocess.run(
-        ["ffmpeg", "-y",
+        ["ffmpeg", "-y", "-threads", "2",
          "-f", "concat", "-safe", "0", "-i", str(concat_txt),
          "-t", str(target_duration),
          "-filter_complex",
@@ -407,16 +527,14 @@ def _collect_music_for_video(job_id: str, session_id: str,
 def _run_phase_b(job: dict, absolute_sec: float, chunk_dir_for_session: Path):
     job_id   = job["job_id"]
     job_dir  = Path(job["job_dir"])
-    duration = job["duration"]   # seconds of YT audio we need to cover
+    duration = job["duration"]
 
     yt_mp3       = job_dir / "yt_audio.mp3"
     music_bg_mp3 = job_dir / "music_bg.mp3"
-    bg_mp3       = job_dir / "bg_window.mp3"   # used only on fallback
+    bg_mp3       = job_dir / "bg_window.mp3"
     mix_mp3      = job_dir / "final_mix.mp3"
 
     # ── 1. Choose background source ────────────────────────────────
-    # Prefer the fresh dedicated music-bg built during Phase A.
-    # Fall back to slicing the existing mixed chunk if music-bg failed.
     if job.get("music_bg_ok") and music_bg_mp3.exists() and music_bg_mp3.stat().st_size > 0:
         bg_source = music_bg_mp3
         log.info(f"[{job_id}] Phase B: using fresh music-bg ({bg_source.stat().st_size/1e6:.1f} MB)")
@@ -427,13 +545,11 @@ def _run_phase_b(job: dict, absolute_sec: float, chunk_dir_for_session: Path):
         bg_source = bg_mp3
 
     # ── 2. amix YT audio + music-only background ───────────────────
-    # YT audio: dynaudnorm so quiet lectures and loud YT uploads land at same level.
-    # Background music: already loudnorm'd, keep at 0.35 weight (clear but under voice).
-    # Final limiter prevents clipping on hot sources.
     log.info(f"[{job_id}] Phase B: mixing streams...")
     _ffmpeg(
         job_id,
-        ["-i", str(yt_mp3),
+        ["-threads", "2",
+         "-i", str(yt_mp3),
          "-i", str(bg_source),
          "-filter_complex",
          "[0:a]aresample=44100,dynaudnorm=f=150:g=15[yt_norm];"
@@ -447,22 +563,47 @@ def _run_phase_b(job: dict, absolute_sec: float, chunk_dir_for_session: Path):
     )
     log.info(f"[{job_id}] Phase B: mix written → {mix_mp3}")
 
+    # ── 3. Mux mixed audio into video if video was downloaded ──────
+    yt_video_path = job_dir / "yt_video.mp4"
+    final_mp4     = job_dir / "final.mp4"
+
+    if job.get("video_ok") and yt_video_path.exists() and yt_video_path.stat().st_size > 0:
+        dur_min = job.get("duration", 0) / 60
+        log.info(f"[{job_id}] Phase B: transcoding to H.264 ({dur_min:.1f} min video) — this takes 2-5 min, DO NOT click again")
+        job["status"] = "rendering"
+        job["render_phase"] = "transcode"
+        _ffmpeg(
+            job_id,
+            ["-i", str(yt_video_path),
+             "-i", str(mix_mp3),
+             "-c:v", "h264_nvenc",
+             "-preset", "p4",
+             "-cq", "23",
+             "-c:a", "aac",
+             "-b:a", "192k",
+             "-map", "0:v:0",
+             "-map", "1:a:0",
+             "-shortest",
+             "-movflags", "+faststart",
+             "-y", str(final_mp4)],
+            job,
+            timeout=900
+        )
+        job["has_video"] = True
+        log.info(f"[{job_id}] Phase B: final.mp4 ready ({final_mp4.stat().st_size/1e6:.1f} MB)")
+    else:
+        log.warning(f"[{job_id}] Phase B: no video available — serving audio-only")
+        job["has_video"] = False
+
 
 def _build_bg_window(job_id: str, start_abs: float, duration: float,
                      chunk_dir: Path, out_path: Path):
     """
     Slice `duration` seconds of background audio starting at `start_abs`.
-
-    Prefers music-only chunks ({N}_music.mp3) so that the adhoc video audio
-    mixes with music only — no competing speech track.
-    Falls back to the full mixed chunk ({N}.mp3) if music-only isn't ready yet.
-
-    Uses assumed CHUNK_DURATION_SEC for interior chunks; only probes edge chunks.
-    Falls back to re-encode if copy-only produces a broken file.
+    Prefers music-only chunks, falls back to full mixed chunk.
     """
     end_abs = start_abs + duration
 
-    # Prefer music-only ({N}_music.mp3), fall back to full mix ({N}.mp3)
     def best_chunk_for(n_stem: str, chunk_dir: Path):
         music_only = chunk_dir / f"{n_stem}_music.mp3"
         if music_only.exists() and music_only.stat().st_size > 0:
@@ -472,7 +613,6 @@ def _build_bg_window(job_id: str, start_abs: float, duration: float,
             return full_mix, False
         return None, False
 
-    # Enumerate all final chunk stems (purely numeric)
     chunk_stems = sorted(
         [p.stem for p in chunk_dir.glob("*.mp3")
          if p.suffix == ".mp3" and p.stem.isdigit()],
@@ -485,12 +625,11 @@ def _build_bg_window(job_id: str, start_abs: float, duration: float,
             f"Expected files named like 33.mp3, 34.mp3 etc."
         )
 
-    # Determine which chunk indices we'll actually need (for selective probing)
     first_needed_idx = max(0, int(start_abs // CHUNK_DURATION_SEC))
     last_needed_idx  = min(len(chunk_stems) - 1,
                            int(end_abs // CHUNK_DURATION_SEC) + 1)
 
-    timeline = []  # list of (chunk_path, is_music_only, chunk_start_abs, chunk_end_abs)
+    timeline = []
     t = 0.0
     for i, stem in enumerate(chunk_stems):
         chunk_path, is_music_only = best_chunk_for(stem, chunk_dir)
@@ -518,7 +657,6 @@ def _build_bg_window(job_id: str, start_abs: float, duration: float,
     log.info(f"[{job_id}] Building bg window: {len(timeline)} chunks, "
              f"need abs={start_abs:.1f}-{end_abs:.1f}s")
 
-    # Find all chunks overlapping [start_abs, end_abs)
     chunks_needed = []
     for (chunk_path, chunk_start, chunk_end) in timeline:
         if chunk_end <= start_abs:
@@ -535,7 +673,6 @@ def _build_bg_window(job_id: str, start_abs: float, duration: float,
             f"in {chunk_dir}. Timeline covers 0-{t:.1f}s across {len(timeline)} chunks."
         )
 
-    # Write concat list
     concat_txt = out_path.parent / "concat_list.txt"
     with open(concat_txt, "w") as f:
         for (path, inpoint, outpoint) in chunks_needed:
@@ -549,7 +686,7 @@ def _build_bg_window(job_id: str, start_abs: float, duration: float,
     # Attempt copy-only first
     try:
         result = subprocess.run(
-            ["ffmpeg",
+            ["ffmpeg", "-threads", "2",
              "-f", "concat", "-safe", "0",
              "-i", str(concat_txt),
              "-c", "copy",
@@ -566,7 +703,7 @@ def _build_bg_window(job_id: str, start_abs: float, duration: float,
 
     # Re-encode fallback
     result = subprocess.run(
-        ["ffmpeg",
+        ["ffmpeg", "-threads", "2",
          "-f", "concat", "-safe", "0",
          "-i", str(concat_txt),
          "-ar", "44100", "-ac", "2", "-b:a", "192k",
@@ -596,6 +733,49 @@ def _normalise_url(url: str) -> str:
 
 
 def _yt_dlp_info(url: str) -> dict:
+    """
+    Probe YouTube URL for metadata.
+    Uses pinned daemon worker when available (~2ms hot dispatch vs ~400ms cold import).
+    Falls back to direct inline import if daemon not running.
+    """
+    client = _get_daemon()
+    if client:
+        # Embed URL directly — it's already a clean https:// string from _normalise_url()
+        safe_url = url.replace("'", "\\'")
+        code = f"""
+import yt_dlp
+ydl_opts = {{"quiet": True, "no_warnings": True, "skip_download": True, "extract_flat": False}}
+with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    info = ydl.extract_info('{safe_url}', download=False)
+if not info:
+    raise ValueError("Could not extract video info from URL")
+result = {{
+    "title":    info.get("title"),
+    "duration": info.get("duration"),
+    "is_live":  info.get("is_live"),
+    "id":       info.get("id"),
+}}
+"""
+        try:
+            res = client.execute_smart(
+                _YTDLP_SPEC,
+                code,
+                worker_tag="ytdlp-info",
+                pin=True,
+            )
+            if res.get("success"):
+                # daemon puts worker's `result = {...}` assignment into res["meta"]
+                data = res.get("meta") or {}
+                if isinstance(data, dict) and "title" in data:
+                    log.info(f"_yt_dlp_info via daemon: {data.get('title')}")
+                    return data
+                log.warning(f"_yt_dlp_info daemon unexpected shape: {repr(res)[:200]} — falling back")
+            else:
+                log.warning(f"_yt_dlp_info daemon call failed: {res.get('error')} — falling back")
+        except Exception as e:
+            log.warning(f"_yt_dlp_info daemon exception: {e} — falling back")
+
+    # Fallback: direct import
     import yt_dlp
     ydl_opts = {
         "quiet": True, "no_warnings": True,
@@ -609,6 +789,49 @@ def _yt_dlp_info(url: str) -> dict:
 
 
 def _yt_dlp_download(job_id: str, url: str, out_path: Path, job: dict):
+    """
+    Download audio-only stream.
+    Uses pinned daemon worker when available.
+    Falls back to direct inline import if daemon not running.
+
+    NOTE: The daemon path cannot observe job["status"] == "cancelled" in real time
+    (the job dict lives in a different process). Cancellation during download
+    via the daemon has ~poll-interval latency rather than instant. This is
+    acceptable — cancel() will terminate the ffmpeg subprocess in Phase B
+    regardless, and the download output is simply discarded.
+    """
+    client = _get_daemon()
+    if client:
+        safe_url      = url.replace("'", "\'")
+        safe_out_path = str(out_path).replace("'", "\'")
+        code = (
+            "import yt_dlp\n"
+            "ydl_opts = {\n"
+            "    'quiet': True,\n"
+            "    'no_warnings': True,\n"
+            "    'format': 'bestaudio[ext=m4a]/bestaudio',\n"
+            f"    'outtmpl': '{safe_out_path}',\n"
+            "    'noplaylist': True,\n"
+            "}\n"
+            "with yt_dlp.YoutubeDL(ydl_opts) as ydl:\n"
+            f"    ydl.download(['{safe_url}'])\n"
+            "result = {'done': True}\n"
+        )
+        try:
+            res = client.execute_smart(
+                _YTDLP_SPEC,
+                code,
+                worker_tag="ytdlp-dl",
+                pin=True,
+            )
+            if res.get("success"):
+                log.info(f"[{job_id}] _yt_dlp_download via daemon ✓")
+                return
+            log.warning(f"[{job_id}] _yt_dlp_download daemon failed: {res.get('error')} — falling back")
+        except Exception as e:
+            log.warning(f"[{job_id}] _yt_dlp_download daemon exception: {e} — falling back")
+
+    # Fallback: direct import
     import yt_dlp
 
     class _CancelCheck(yt_dlp.postprocessor.common.PostProcessor):
@@ -629,25 +852,112 @@ def _yt_dlp_download(job_id: str, url: str, out_path: Path, job: dict):
         ydl.download([url])
 
 
+def _yt_dlp_download_video(job_id: str, url: str, out_path: Path, job: dict):
+    """
+    Download best H.264 video-only stream (no audio — we supply our own mixed audio).
+    Uses pinned daemon worker when available.
+    Falls back to direct inline import if daemon not running.
+    """
+    client = _get_daemon()
+    if client:
+        safe_url      = url.replace("'", "\'")
+        safe_out_path = str(out_path).replace("'", "\'")
+        code = (
+            "import yt_dlp\n"
+            "ydl_opts = {\n"
+            "    'quiet': True,\n"
+            "    'no_warnings': True,\n"
+            "    'format': 'bestvideo[vcodec^=avc1][height<=1080]/bestvideo[vcodec^=avc1]/bestvideo[ext=mp4]/bestvideo',\n"
+            f"    'outtmpl': '{safe_out_path}',\n"
+            "    'noplaylist': True,\n"
+            "}\n"
+            "with yt_dlp.YoutubeDL(ydl_opts) as ydl:\n"
+            f"    ydl.download(['{safe_url}'])\n"
+            "result = {'done': True}\n"
+        )
+        try:
+            res = client.execute_smart(
+                _YTDLP_SPEC,
+                code,
+                worker_tag="ytdlp-dl",
+                pin=True,
+            )
+            if res.get("success"):
+                log.info(f"[{job_id}] _yt_dlp_download_video via daemon ✓")
+                return
+            log.warning(f"[{job_id}] _yt_dlp_download_video daemon failed: {res.get('error')} — falling back")
+        except Exception as e:
+            log.warning(f"[{job_id}] _yt_dlp_download_video daemon exception: {e} — falling back")
+
+    # Fallback: direct import
+    import yt_dlp
+
+    class _CancelCheck(yt_dlp.postprocessor.common.PostProcessor):
+        def run(self, info):
+            if job.get("status") == "cancelled":
+                raise yt_dlp.utils.DownloadError("Cancelled by user")
+            return [], info
+
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "format": "bestvideo[vcodec^=avc1][height<=1080]/bestvideo[vcodec^=avc1]/bestvideo[ext=mp4]/bestvideo",
+        "outtmpl": str(out_path),
+        "noplaylist": True,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.add_post_processor(_CancelCheck())
+        ydl.download([url])
+
+
 # ---------------------------------------------------------------------------
-# FFmpeg helpers
+# FFmpeg helpers  (unchanged — ffmpeg is a binary, not daemon-able)
 # ---------------------------------------------------------------------------
 
 def _ffmpeg(job_id: str, args: list, job: dict, timeout: int = 600):
-    cmd = ["ffmpeg"] + args
-    log.debug(f"[{job_id}] ffmpeg: {' '.join(cmd)}")
+    import re, threading, time as _time
+    cmd = ["ffmpeg", "-progress", "pipe:2", "-nostats"] + args
+    log.debug(f"[{job_id}] ffmpeg: {chr(32).join(cmd)}")
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     job["_proc"] = proc
+
+    stderr_lines = []
+    last_log = [0.0]
+    duration_sec = [None]
+
+    def _read_stderr():
+        for raw in proc.stderr:
+            line = raw.decode(errors="replace").rstrip()
+            stderr_lines.append(line)
+            if line.startswith("out_time_ms="):
+                try:
+                    ms = int(line.split("=", 1)[1])
+                    elapsed_sec = ms / 1_000_000
+                    now = _time.monotonic()
+                    if now - last_log[0] >= 15:
+                        last_log[0] = now
+                        dur = job.get("duration", 0)
+                        pct = f"{elapsed_sec/dur*100:.0f}%" if dur else f"{elapsed_sec:.0f}s"
+                        log.info(f"[{job_id}] ffmpeg transcode: {elapsed_sec:.0f}s / {pct}")
+                        job["transcode_progress"] = pct
+                except (ValueError, ZeroDivisionError):
+                    pass
+
+    t = threading.Thread(target=_read_stderr, daemon=True)
+    t.start()
+
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
+        proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         proc.kill()
         raise RuntimeError(f"FFmpeg timed out after {timeout}s")
     finally:
+        t.join(timeout=5)
         job["_proc"] = None
 
     if proc.returncode != 0:
-        raise RuntimeError(f"FFmpeg failed (rc={proc.returncode}): {stderr.decode()[-400:]}")
+        tail = "\n".join(stderr_lines[-20:])
+        raise RuntimeError(f"FFmpeg failed (rc={proc.returncode}): {tail[-600:]}")
 
 
 def _probe_duration(path: Path) -> float:
